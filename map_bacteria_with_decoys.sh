@@ -18,10 +18,12 @@ source "$CONFIG_FILE"
 : "${SAMPLE_READS:=false}"
 : "${SAMPLE_SIZE:=5000}"
 : "${SAMPLE_SEED:=1}"
-: "${DECOY_BOWTIE2_INDEX:?Set DECOY_BOWTIE2_INDEX in $CONFIG_FILE}"
-: "${BACTERIA_BOWTIE2_INDEX:?Set BACTERIA_BOWTIE2_INDEX in $CONFIG_FILE}"
-: "${HOST_BOWTIE2_INDEX:=}"
+: "${DECOY_MINIMAP2_REFERENCE:?Set DECOY_MINIMAP2_REFERENCE in $CONFIG_FILE}"
+: "${BACTERIA_MINIMAP2_REFERENCE:?Set BACTERIA_MINIMAP2_REFERENCE in $CONFIG_FILE}"
+: "${HOST_MINIMAP2_REFERENCE:=}"
+: "${MINIMAP2_PRESET:=map-ont}"
 : "${ADAPTER_SINGLE:=${ADAPTER_SEQUENCE:-AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC}}"
+: "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
 : "${ADAPTER_R1:=CTGTCTCTTATACACATCT}"
 : "${ADAPTER_R2:=CTGTCTCTTATACACATCT}"
 : "${MIN_READ_LENGTH:=22}"
@@ -84,27 +86,27 @@ find_gene_identifier_attribute() {
   '
 }
 
-BACTERIA_GFF=$(find_gff_annotation "$BACTERIA_BOWTIE2_INDEX" "bacterial")
+BACTERIA_GFF=$(find_gff_annotation "$BACTERIA_MINIMAP2_REFERENCE" "bacterial")
 if ! BACTERIA_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$BACTERIA_GFF"); then
   echo "ERROR: bacterial annotation has none of the locus, locus_tag, or gene attributes: $BACTERIA_GFF" >&2
   exit 1
 fi
 HOST_GFF=""
 HOST_GENE_ATTRIBUTE=""
-if [[ -n "$HOST_BOWTIE2_INDEX" ]]; then
-  HOST_GFF=$(find_gff_annotation "$HOST_BOWTIE2_INDEX" "host")
+if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
+  HOST_GFF=$(find_gff_annotation "$HOST_MINIMAP2_REFERENCE" "host")
   if ! HOST_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$HOST_GFF"); then
     echo "ERROR: host annotation has none of the locus, locus_tag, or gene attributes: $HOST_GFF" >&2
     exit 1
   fi
 fi
 
-ALIGNMENT_DIR="$OUTPUT_DIR/bowtie_alignments"
+ALIGNMENT_DIR="$OUTPUT_DIR/minimap2_alignments"
 DECOY_ALIGNMENT_DIR="$ALIGNMENT_DIR/decoy"
 BACTERIA_ALIGNMENT_DIR="$ALIGNMENT_DIR/bacteria"
 HOST_ALIGNMENT_DIR="$ALIGNMENT_DIR/host"
 mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR"
-if [[ -n "$HOST_BOWTIE2_INDEX" ]]; then
+if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
   mkdir -p "$HOST_ALIGNMENT_DIR"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,24 +114,17 @@ if [[ "$CSV_CONVERSION_SCRIPT" != /* ]]; then
   CSV_CONVERSION_SCRIPT="$SCRIPT_DIR/$CSV_CONVERSION_SCRIPT"
 fi
 
-# Reuse a complete Bowtie2 index when one is present. Otherwise, build it from
-# a FASTA beside the configured basename (for example, reference.fa for the
-# basename reference). Fail before processing reads if neither input exists.
-prepare_bowtie2_index() {
+# Reuse a minimap2 index or build one from a FASTA beside the configured
+# basename. The basename convention also keeps annotation discovery unchanged.
+prepare_minimap2_index() {
   local index_basename="$1"
   local reference_label="$2"
   local threads="$3"
-  local index_extension index_part fasta_extension fasta_file
-
-  for index_extension in bt2 bt2l; do
-    for index_part in 1 2 3 4 rev.1 rev.2; do
-      [[ -f "${index_basename}.${index_part}.${index_extension}" ]] || break
-    done
-    if [[ "$index_part" == "rev.2" && -f "${index_basename}.rev.2.${index_extension}" ]]; then
-      echo "using existing $reference_label Bowtie2 index: $index_basename"
-      return 0
-    fi
-  done
+  local fasta_extension fasta_file
+  if [[ -f "${index_basename}.mmi" ]]; then
+    echo "using existing $reference_label minimap2 index: ${index_basename}.mmi"
+    return 0
+  fi
 
   fasta_file=""
   for fasta_extension in fa fasta fna fa.gz fasta.gz fna.gz; do
@@ -140,20 +135,19 @@ prepare_bowtie2_index() {
   done
 
   if [[ -z "$fasta_file" ]]; then
-    echo "ERROR: $reference_label Bowtie2 index not found for basename: $index_basename" >&2
     echo "ERROR: No reference FASTA found; expected ${index_basename}.{fa,fasta,fna}[.gz]." >&2
     return 1
   fi
 
   mkdir -p "$(dirname "$index_basename")"
-  echo "building $reference_label Bowtie2 index from $fasta_file ..."
-  bowtie2-build --threads "$threads" "$fasta_file" "$index_basename"
+  echo "building $reference_label minimap2 index from $fasta_file ..."
+  minimap2 -t "$threads" -d "${index_basename}.mmi" "$fasta_file"
 }
 
-prepare_bowtie2_index "$DECOY_BOWTIE2_INDEX" "decoy" "$THREADS"
-prepare_bowtie2_index "$BACTERIA_BOWTIE2_INDEX" "bacterial" "$THREADS"
-if [[ -n "$HOST_BOWTIE2_INDEX" ]]; then
-  prepare_bowtie2_index "$HOST_BOWTIE2_INDEX" "host" "$THREADS"
+prepare_minimap2_index "$DECOY_MINIMAP2_REFERENCE" "decoy" "$THREADS"
+prepare_minimap2_index "$BACTERIA_MINIMAP2_REFERENCE" "bacterial" "$THREADS"
+if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
+  prepare_minimap2_index "$HOST_MINIMAP2_REFERENCE" "host" "$THREADS"
 fi
 
 matched_fastqs=("$FASTQ_DIR"/$FASTQ_GLOB)
@@ -286,67 +280,85 @@ for idx in "${!read1_filenames[@]}"; do
       > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
     trim_r2+=("$out2")
   else
-    cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_SINGLE" -o "$out1" "${read1_filenames[$idx]}" \
+    cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_SINGLE" -a "$ADAPTER_NANOPORE" \
+      -o "$out1" "${read1_filenames[$idx]}" \
       > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
   fi
   trim_r1+=("$out1"); sample_names+=("$sample")
 done
 
-# Mapping to bacterial decoys.
+# Count complete FASTQ records (plain or gzip-compressed).
+fastq_read_count() {
+  if [[ "$1" == *.gz ]]; then gzip -cd -- "$1"; else cat -- "$1"; fi |
+    awk 'END { if (NR % 4) exit 1; print NR / 4 }'
+}
+
+# Align reads with the nanopore-aware minimap2 preset, retain only primary
+# alignments in SAM, and write unmapped reads for the next classification stage.
+# The small TSV report is intentionally stable input for both CSV generators.
+minimap2_stage() {
+  local reference="$1" sam="$2" report="$3" unmapped1="$4" unmapped2="$5" input1="$6"
+  shift 6
+  local input_count unmapped_count aligned_count raw_log="${report%.txt}.minimap2.stderr.txt"
+  input_count=$(fastq_read_count "$input1")
+  minimap2 -t "$THREADS" -ax "$MINIMAP2_PRESET" --secondary=no "${reference}.mmi" "$@" \
+    2> "$raw_log" | samtools view -h -F 2304 -o "$sam" -
+  if [[ "$READ_LAYOUT" == "paired" ]]; then
+    samtools fastq -@ "$THREADS" -f 12 -1 "$unmapped1" -2 "$unmapped2" \
+      -0 /dev/null -s /dev/null -n "$sam" 2>> "$raw_log"
+  else
+    samtools fastq -@ "$THREADS" -f 4 -0 "$unmapped1" -s /dev/null -n "$sam" 2>> "$raw_log"
+  fi
+  unmapped_count=$(fastq_read_count "$unmapped1")
+  aligned_count=$((input_count - unmapped_count))
+  printf 'metric\tcount\ninput\t%s\naligned\t%s\nunmapped\t%s\n' \
+    "$input_count" "$aligned_count" "$unmapped_count" > "$report"
+}
+
+# Map to bacterial decoys and pass only primary-unmapped reads onward.
 decoy_r1=(); decoy_r2=()
 for idx in "${!trim_r1[@]}"; do
   i="${trim_r1[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-  echo "mapping to bacterial decoys: $i_basename ..."
-  if [[ "$READ_LAYOUT" == "paired" ]]; then
-    unmapped="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs_%.fastq.gz"
-    bowtie2 -p "$THREADS" -x "$DECOY_BOWTIE2_INDEX" -1 "$i" -2 "${trim_r2[$idx]}" \
-      -S "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.sam" --un-conc-gz "$unmapped" \
-      2> "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.bowtie2.txt"
-    decoy_r1+=("${unmapped/\%/1}"); decoy_r2+=("${unmapped/\%/2}")
-  else
-    unmapped="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs.fastq.gz"
-    bowtie2 -p "$THREADS" -x "$DECOY_BOWTIE2_INDEX" -U "$i" \
-    -S "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.sam" \
-    --un-gz "$unmapped" \
-    2> "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.bowtie2.txt"
-    decoy_r1+=("$unmapped")
-  fi
+  echo "mapping to bacterial decoys with minimap2: $i_basename ..."
+  unmapped1="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs.fastq.gz"
+  unmapped2="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs_R2.fastq.gz"
+  inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${trim_r2[$idx]}")
+  minimap2_stage "$DECOY_MINIMAP2_REFERENCE" \
+    "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.sam" \
+    "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.minimap2.txt" \
+    "$unmapped1" "$unmapped2" "$i" "${inputs[@]}"
+  decoy_r1+=("$unmapped1"); [[ "$READ_LAYOUT" == "paired" ]] && decoy_r2+=("$unmapped2")
 done
 
-# Mapping to the target bacterial reference with Bowtie2.
-HOST_trim_filenames=()
-HOST_trim_mates=()
+# Map decoy-unmapped reads to the target bacterium.
+HOST_trim_filenames=(); HOST_trim_mates=()
 for idx in "${!decoy_r1[@]}"; do
   i="${decoy_r1[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-  echo "mapping to the bacterial reference: $i_basename ..."
+  echo "mapping to the bacterial reference with minimap2: $i_basename ..."
   host_input="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria.fastq.gz"
-  if [[ "$READ_LAYOUT" == "paired" ]]; then
-    host_template="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria_%.fastq.gz"
-    bowtie2 --end-to-end -p "$THREADS" -x "$BACTERIA_BOWTIE2_INDEX" -q -1 "$i" -2 "${decoy_r2[$idx]}" \
-      -S "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" --un-conc-gz "$host_template" \
-      2> "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.bowtie_output.txt"
-    HOST_trim_filenames+=("${host_template/\%/1}"); HOST_trim_mates+=("${host_template/\%/2}")
-  else
-    bowtie2 --end-to-end -p "$THREADS" -x "$BACTERIA_BOWTIE2_INDEX" -q -U "$i" \
-    -S "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" \
-    --un-gz "$host_input" \
-    2> "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.bowtie_output.txt"
-    HOST_trim_filenames+=("$host_input")
-  fi
+  host_mate="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria_R2.fastq.gz"
+  inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${decoy_r2[$idx]}")
+  minimap2_stage "$BACTERIA_MINIMAP2_REFERENCE" \
+    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" \
+    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.minimap2.txt" \
+    "$host_input" "$host_mate" "$i" "${inputs[@]}"
+  HOST_trim_filenames+=("$host_input"); [[ "$READ_LAYOUT" == "paired" ]] && HOST_trim_mates+=("$host_mate")
 done
 
 BACTERIA_sam_filenames=("$BACTERIA_ALIGNMENT_DIR"/BACTERIA*.sam)
 
-# Optionally align reads that mapped to neither the decoy nor the bacterial
-# reference. An empty host index basename disables host alignment.
-if [[ -n "$HOST_BOWTIE2_INDEX" ]]; then
+# Optionally classify reads that mapped to neither decoys nor bacteria as host.
+if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
   for idx in "${!HOST_trim_filenames[@]}"; do
     i="${HOST_trim_filenames[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-    echo "mapping to the host reference: $i_basename ..."
-    if [[ "$READ_LAYOUT" == "paired" ]]; then input_args=(-1 "$i" -2 "${HOST_trim_mates[$idx]}"); else input_args=(-U "$i"); fi
-    bowtie2 --end-to-end -p "$THREADS" -x "$HOST_BOWTIE2_INDEX" -q "${input_args[@]}" \
-      -S "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
-      2> "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.bowtie_output.txt"
+    echo "mapping to the host reference with minimap2: $i_basename ..."
+    inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${HOST_trim_mates[$idx]}")
+    minimap2_stage "$HOST_MINIMAP2_REFERENCE" \
+      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
+      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.minimap2.txt" \
+      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host.fastq.gz" \
+      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host_R2.fastq.gz" \
+      "$i" "${inputs[@]}"
   done
 fi
 
@@ -364,7 +376,7 @@ featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -s 1 "${featurecounts_pair_args[@
   -o "$OUTPUT_DIR/featurecounts_BACTERIA_rRNA.txt" "${BACTERIA_sam_filenames[@]}"
 
 # When a host reference is configured, independently assign host alignments to
-# its CDS features and keep the results alongside the host Bowtie2 outputs.
+# its CDS features and keep the results alongside the host minimap2 outputs.
 if [[ -n "$HOST_GFF" ]]; then
   HOST_sam_filenames=("$HOST_ALIGNMENT_DIR"/HOST_*.sam)
   featureCounts -T "$THREADS" -a "$HOST_GFF" -O -s 1 "${featurecounts_pair_args[@]}" -g "$HOST_GENE_ATTRIBUTE" -t CDS \

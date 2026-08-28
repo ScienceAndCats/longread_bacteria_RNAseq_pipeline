@@ -39,19 +39,14 @@ def cutadapt_counts(path):
     return total, passing
 
 
-def bowtie_counts(path):
-    """Return input and aligned read/read-pair counts from a Bowtie2 report."""
-    report = path.read_text()
-    total = report_number(report, r"^\s*([\d,]+) reads; of these:", path)
-    if "were paired; of these:" in report:
-        unaligned = report_number(
-            report, r"^\s*([\d,]+) \([^\n]+\) aligned concordantly 0 times$", path
-        )
-    else:
-        unaligned = report_number(
-            report, r"^\s*([\d,]+) \([^\n]+\) aligned 0 times$", path
-        )
-    return total, total - unaligned
+def minimap2_counts(path):
+    """Return input and aligned counts from the pipeline minimap2 TSV report."""
+    with path.open() as handle:
+        metrics = dict(line.rstrip("\n").split("\t") for line in handle if "\t" in line)
+    try:
+        return int(metrics["input"]), int(metrics["aligned"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Unexpected minimap2 report format: {path}") from exc
 
 
 def sample_from_log(path):
@@ -91,7 +86,7 @@ def build_table(output_dir):
 
     bacteria_rrna_path = output_dir / "featurecounts_BACTERIA_rRNA.txt.summary"
     bacteria_rrna = assigned_by_sample(bacteria_rrna_path, "BACTERIA")
-    host_rrna_path = output_dir / "bowtie_alignments/host/featurecounts_HOST_rRNA.txt.summary"
+    host_rrna_path = output_dir / "minimap2_alignments/host/featurecounts_HOST_rRNA.txt.summary"
     host_enabled = host_rrna_path.exists()
     host_rrna = assigned_by_sample(host_rrna_path, "HOST") if host_enabled else {}
 
@@ -101,16 +96,16 @@ def build_table(output_dir):
         total, passing = cutadapt_counts(cutadapt_path)
         # Allow a configured minimum length other than the historical 22 bp default.
         length = re.search(r"_(\d+)bp\.cutadapt_log", cutadapt_path.name).group(1)
-        decoy_path = output_dir / f"bowtie_alignments/decoy/{sample}_{length}bp.mapped_to_other_bugs.bowtie2.txt"
-        bacteria_path = output_dir / f"bowtie_alignments/bacteria/BACTERIA_{sample}_{length}bp.bowtie_output.txt"
-        decoy_input, decoy_aligned = bowtie_counts(decoy_path)
-        bacteria_input, bacteria_aligned = bowtie_counts(bacteria_path)
+        decoy_path = output_dir / f"minimap2_alignments/decoy/{sample}_{length}bp.mapped_to_other_bugs.minimap2.txt"
+        bacteria_path = output_dir / f"minimap2_alignments/bacteria/BACTERIA_{sample}_{length}bp.minimap2.txt"
+        decoy_input, decoy_aligned = minimap2_counts(decoy_path)
+        bacteria_input, bacteria_aligned = minimap2_counts(bacteria_path)
         if decoy_input != passing or bacteria_input != passing - decoy_aligned:
             raise ValueError(f"Stage totals are inconsistent for sample {sample}")
 
-        host_path = output_dir / f"bowtie_alignments/host/HOST_{sample}_{length}bp.bowtie_output.txt"
+        host_path = output_dir / f"minimap2_alignments/host/HOST_{sample}_{length}bp.minimap2.txt"
         if host_enabled:
-            host_input, host_aligned = bowtie_counts(host_path)
+            host_input, host_aligned = minimap2_counts(host_path)
             if host_input != bacteria_input - bacteria_aligned:
                 raise ValueError(f"Host stage total is inconsistent for sample {sample}")
         else:
@@ -135,10 +130,10 @@ def build_table(output_dir):
         sources = {
             "Total reads": f"{cutadapt_path.name}: Total reads/read pairs processed",
             "Reads passing cutadapt length filter": f"{cutadapt_path.name}: Reads/pairs written (passing filters)",
-            "Decoy aligned": f"{decoy_path.relative_to(output_dir)}: input minus aligned 0 times",
-            "Bacteria aligned": f"{bacteria_path.relative_to(output_dir)}: input minus aligned 0 times",
+            "Decoy aligned": f"{decoy_path.relative_to(output_dir)}: pipeline primary-alignment count",
+            "Bacteria aligned": f"{bacteria_path.relative_to(output_dir)}: pipeline primary-alignment count",
             "Bacteria rRNA": f"{bacteria_rrna_path.relative_to(output_dir)}: Assigned",
-            "Host aligned": (f"{host_path.relative_to(output_dir)}: input minus aligned 0 times" if host_enabled else "Host alignment not configured"),
+            "Host aligned": (f"{host_path.relative_to(output_dir)}: pipeline primary-alignment count" if host_enabled else "Host alignment not configured"),
             "Host rRNA": (f"{host_rrna_path.relative_to(output_dir)}: Assigned" if host_enabled else "Host alignment not configured"),
         }
         sources["Bacteria non-rRNA"] = "Calculated: Bacteria aligned minus Bacteria rRNA"
