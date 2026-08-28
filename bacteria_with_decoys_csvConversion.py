@@ -5,7 +5,7 @@ import fnmatch
 import os
 import re
 
-BOWTIE_BACTERIA_DIR = os.path.join("bowtie_alignments", "bacteria")
+MINIMAP2_BACTERIA_DIR = os.path.join("minimap2_alignments", "bacteria")
 
 ### Creates a list of featureCounts files to count ###
 featureCountsFiles = []
@@ -20,25 +20,25 @@ for file in os.listdir("."):
          cutadaptFiles.append(file)
 cutadaptFiles = sorted(cutadaptFiles, key=str.casefold)
 
-### Creates list of bowtie files to count ###
-bowtieFiles = []
-for file in os.listdir(BOWTIE_BACTERIA_DIR):
-    if fnmatch.fnmatch(file, "BACTERIA*.bowtie_output.txt"):
-        bowtieFiles.append(os.path.join(BOWTIE_BACTERIA_DIR, file))
-bowtieFiles= sorted(bowtieFiles, key=str.casefold)
+### Creates list of minimap2 reports to count ###
+minimap2Files = []
+for file in os.listdir(MINIMAP2_BACTERIA_DIR):
+    if fnmatch.fnmatch(file, "BACTERIA*.minimap2.txt"):
+        minimap2Files.append(os.path.join(MINIMAP2_BACTERIA_DIR, file))
+minimap2Files= sorted(minimap2Files, key=str.casefold)
 
 ### Creates list of coverage files to count ###
 coverageFilesList = []
-for file in os.listdir(BOWTIE_BACTERIA_DIR):
+for file in os.listdir(MINIMAP2_BACTERIA_DIR):
     if fnmatch.fnmatch(file, "BACTERIA*_coverage.txt"):
-        coverageFilesList.append(os.path.join(BOWTIE_BACTERIA_DIR, file))
+        coverageFilesList.append(os.path.join(MINIMAP2_BACTERIA_DIR, file))
 coverageFilesList= sorted(coverageFilesList, key=str.casefold)
 
 ### Creates a list of filenames ###
 filenames = []
 for i in cutadaptFiles:
     f = i.strip()
-    filenames.append(f.replace('_22bp.cutadapt_log.txt', ''))
+    filenames.append(re.sub(r'_\d+bp\.cutadapt_log\.txt$', '', f))
 filenames = sorted(filenames, key=str.casefold)
 
 ### Creates output csv template
@@ -62,18 +62,15 @@ for file in cutadaptFiles:
     rawReadsList.append(raw_match.group(1).replace(',', ''))
     readsWrittenList.append(written_match.group(1).replace(',', ''))
 
-### Opens bowtie txt files and saves overall allignment and reads not mapped to decoy ###
+### Opens minimap2 report files and saves overall allignment and reads not mapped to decoy ###
 #notMappedtoDecoyList = []
 overallAlignmentList = []
-for file in bowtieFiles:
+for file in minimap2Files:
     with open(file, "r") as f:
-        report = f.read()
-    aligned = re.findall(
-        r"^\s*(\d+) .*aligned (?:concordantly )?(?:exactly 1 time|>1 times)",
-        report,
-        re.MULTILINE,
-    )
-    overallAlignmentList.append(str(sum(map(int, aligned))))
+        metrics = dict(line.rstrip("\n").split("\t") for line in f if "\t" in line)
+    if "aligned" not in metrics:
+        raise ValueError(f"Could not parse minimap2 report: {file}")
+    overallAlignmentList.append(metrics["aligned"])
 
 ### Opens coverageFiles and makes lists of percent coverage and mean coverage ###
 percentCoverageList = []
@@ -101,18 +98,15 @@ for file in cutadaptFiles:
     rawReadsList.append(raw_match.group(1).replace(',', ''))
     readsWrittenList.append(written_match.group(1).replace(',', ''))
 
-### Opens bowtie txt files and saves overall allignment and reads not mapped to decoy ###
+### Opens minimap2 report files and saves overall allignment and reads not mapped to decoy ###
 #notMappedtoDecoyList = []
 overallAlignmentList = []
-for file in bowtieFiles:
+for file in minimap2Files:
     with open(file, "r") as f:
-        report = f.read()
-    aligned = re.findall(
-        r"^\s*(\d+) .*aligned (?:concordantly )?(?:exactly 1 time|>1 times)",
-        report,
-        re.MULTILINE,
-    )
-    overallAlignmentList.append(str(sum(map(int, aligned))))
+        metrics = dict(line.rstrip("\n").split("\t") for line in f if "\t" in line)
+    if "aligned" not in metrics:
+        raise ValueError(f"Could not parse minimap2 report: {file}")
+    overallAlignmentList.append(metrics["aligned"])
 
 ### Opens coverageFiles and makes lists of percent coverage and mean coverage ###
 percentCoverageList = []
