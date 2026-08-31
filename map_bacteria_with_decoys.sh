@@ -13,7 +13,6 @@ source "$CONFIG_FILE"
 
 : "${FASTQ_DIR:=.}"
 : "${FASTQ_GLOB:=*.fastq}"
-: "${READ_LAYOUT:=single}"
 : "${OUTPUT_DIR:=.}"
 : "${SAMPLE_READS:=false}"
 : "${SAMPLE_SIZE:=5000}"
@@ -22,10 +21,7 @@ source "$CONFIG_FILE"
 : "${BACTERIA_MINIMAP2_REFERENCE:?Set BACTERIA_MINIMAP2_REFERENCE in $CONFIG_FILE}"
 : "${HOST_MINIMAP2_REFERENCE:=}"
 : "${MINIMAP2_PRESET:=map-ont}"
-: "${ADAPTER_SINGLE:=${ADAPTER_SEQUENCE:-AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC}}"
 : "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
-: "${ADAPTER_R1:=CTGTCTCTTATACACATCT}"
-: "${ADAPTER_R2:=CTGTCTCTTATACACATCT}"
 : "${MIN_READ_LENGTH:=22}"
 : "${THREADS:=16}"
 : "${GENE_POSITION_BINS:=100}"
@@ -35,7 +31,10 @@ source "$CONFIG_FILE"
 [[ "$THREADS" =~ ^[1-9][0-9]*$ ]] || { echo "THREADS must be a positive integer" >&2; exit 1; }
 [[ "$GENE_POSITION_BINS" =~ ^[1-9][0-9]*$ ]] || { echo "GENE_POSITION_BINS must be a positive integer" >&2; exit 1; }
 [[ "$METAGENE_MIN_FEATURE_READS" =~ ^[1-9][0-9]*$ ]] || { echo "METAGENE_MIN_FEATURE_READS must be a positive integer" >&2; exit 1; }
-[[ "$READ_LAYOUT" == "single" || "$READ_LAYOUT" == "paired" ]] || { echo "READ_LAYOUT must be single or paired" >&2; exit 1; }
+case "$MINIMAP2_PRESET" in
+  map-ont|map-hifi|map-pb) ;;
+  *) echo "MINIMAP2_PRESET must be a long-read preset: map-ont, map-hifi, or map-pb" >&2; exit 1 ;;
+esac
 
 shopt -s nullglob
 
@@ -156,24 +155,7 @@ if (( ${#matched_fastqs[@]} == 0 )); then
   exit 1
 fi
 
-read1_filenames=()
-read2_filenames=()
-if [[ "$READ_LAYOUT" == "paired" ]]; then
-  for i in "${matched_fastqs[@]}"; do
-    if [[ "$i" =~ _R1(_[^/]*)?\.fastq(\.gz)?$ ]]; then
-      mate="${i%_R1*}_R2${i##*_R1}"
-      [[ -f "$mate" ]] || { echo "ERROR: Missing R2 mate for $i (expected $mate)" >&2; exit 1; }
-      read1_filenames+=("$i")
-      read2_filenames+=("$mate")
-    elif [[ "$i" =~ _R2(_[^/]*)?\.fastq(\.gz)?$ ]]; then
-      mate="${i%_R2*}_R1${i##*_R2}"
-      [[ -f "$mate" ]] || { echo "ERROR: Missing R1 mate for $i (expected $mate)" >&2; exit 1; }
-    fi
-  done
-  (( ${#read1_filenames[@]} > 0 )) || { echo "No paired FASTQs named *_R1[_suffix].fastq[.gz] and *_R2[_suffix].fastq[.gz] found" >&2; exit 1; }
-else
-  read1_filenames=("${matched_fastqs[@]}")
-fi
+fastq_files=("${matched_fastqs[@]}")
 
 # Randomly subsample complete FASTQ records with reservoir sampling. This keeps
 # memory use bounded by SAMPLE_SIZE even for very large input files.
@@ -214,77 +196,34 @@ with open(output_path, "w") as destination:
 PY
 }
 
-# Sample the same record numbers from both mates so pairing is preserved.
-sample_fastq_pair() {
-  python3 - "$1" "$2" "$3" "$4" "$SAMPLE_SIZE" "$SAMPLE_SEED" <<'PY'
-import gzip, hashlib, random, sys
-r1, r2, out1, out2, size, seed = sys.argv[1:]
-size = int(size)
-opener = lambda path: gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
-rng = random.Random(f"{seed}:{hashlib.sha256((r1 + ':' + r2).encode()).hexdigest()}")
-reservoir = []
-with opener(r1) as first, opener(r2) as second:
-    count = 0
-    while True:
-        a, b = [first.readline() for _ in range(4)], [second.readline() for _ in range(4)]
-        if not a[0] and not b[0]: break
-        if not a[0] or not b[0] or any(x == "" for x in a + b):
-            raise SystemExit(f"Mates have unequal or incomplete FASTQ records: {r1}, {r2}")
-        if count < size: reservoir.append((a, b))
-        else:
-            replacement = rng.randrange(count + 1)
-            if replacement < size: reservoir[replacement] = (a, b)
-        count += 1
-with open(out1, "w") as first, open(out2, "w") as second:
-    for a, b in reservoir: first.writelines(a); second.writelines(b)
-PY
-}
-
 case "${SAMPLE_READS,,}" in
   true)
     [[ "$SAMPLE_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "SAMPLE_SIZE must be a positive integer" >&2; exit 1; }
     sample_dir="$OUTPUT_DIR/.bacteria_sampled_fastq"
     rm -rf "$sample_dir"
     mkdir -p "$sample_dir"
-    sampled_r1=(); sampled_r2=()
-    for idx in "${!read1_filenames[@]}"; do
-      out1="$sample_dir/$(basename "${read1_filenames[$idx]%.gz}")"
-      if [[ "$READ_LAYOUT" == "paired" ]]; then
-        out2="$sample_dir/$(basename "${read2_filenames[$idx]%.gz}")"
-        echo "sampling up to $SAMPLE_SIZE read pairs from $(basename "${read1_filenames[$idx]}") and $(basename "${read2_filenames[$idx]}") ..."
-        sample_fastq_pair "${read1_filenames[$idx]}" "${read2_filenames[$idx]}" "$out1" "$out2"
-        sampled_r2+=("$out2")
-      else
-        echo "sampling up to $SAMPLE_SIZE reads from $(basename "${read1_filenames[$idx]}") ..."
-        sample_fastq "${read1_filenames[$idx]}" "$out1"
-      fi
-      sampled_r1+=("$out1")
+    sampled_fastqs=()
+    for input_fastq in "${fastq_files[@]}"; do
+      sampled_fastq="$sample_dir/$(basename "${input_fastq%.gz}")"
+      echo "sampling up to $SAMPLE_SIZE reads from $(basename "$input_fastq") ..."
+      sample_fastq "$input_fastq" "$sampled_fastq"
+      sampled_fastqs+=("$sampled_fastq")
     done
-    read1_filenames=("${sampled_r1[@]}"); read2_filenames=("${sampled_r2[@]}")
+    fastq_files=("${sampled_fastqs[@]}")
     ;;
   false) ;;
   *) echo "SAMPLE_READS must be true or false" >&2; exit 1 ;;
 esac
 
-# Trim adapters while retaining paired mates together.
-trim_r1=(); trim_r2=(); sample_names=()
-for idx in "${!read1_filenames[@]}"; do
-  filename=$(basename "${read1_filenames[$idx]}"); filename=${filename%.gz}; filename=${filename%.fastq}
-  sample="${filename%_R1*}${filename##*_R1}"
-  out1="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.trim.fastq"
-  if [[ "$READ_LAYOUT" == "paired" ]]; then
-    out1="$OUTPUT_DIR/${sample}_R1_${MIN_READ_LENGTH}bp.trim.fastq"
-    out2="$OUTPUT_DIR/${sample}_R2_${MIN_READ_LENGTH}bp.trim.fastq"
-    cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_R1" -A "$ADAPTER_R2" \
-      -o "$out1" -p "$out2" "${read1_filenames[$idx]}" "${read2_filenames[$idx]}" \
-      > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
-    trim_r2+=("$out2")
-  else
-    cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_SINGLE" -a "$ADAPTER_NANOPORE" \
-      -o "$out1" "${read1_filenames[$idx]}" \
-      > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
-  fi
-  trim_r1+=("$out1"); sample_names+=("$sample")
+# Trim the configured long-read adapter and discard reads below the minimum length.
+trimmed_fastqs=(); sample_names=()
+for input_fastq in "${fastq_files[@]}"; do
+  filename=$(basename "$input_fastq"); filename=${filename%.gz}; sample=${filename%.fastq}
+  trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.trim.fastq"
+  cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_NANOPORE" \
+    -o "$trimmed_fastq" "$input_fastq" \
+    > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
+  trimmed_fastqs+=("$trimmed_fastq"); sample_names+=("$sample")
 done
 
 # Count complete FASTQ records (plain or gzip-compressed).
@@ -297,93 +236,79 @@ fastq_read_count() {
 # alignments in SAM, and write unmapped reads for the next classification stage.
 # The small TSV report is intentionally stable input for both CSV generators.
 minimap2_stage() {
-  local reference="$1" sam="$2" report="$3" unmapped1="$4" unmapped2="$5" input1="$6"
-  shift 6
+  local reference="$1" sam="$2" report="$3" unmapped="$4" input="$5"
   local input_count unmapped_count aligned_count raw_log="${report%.txt}.minimap2.stderr.txt"
-  input_count=$(fastq_read_count "$input1")
-  minimap2 -t "$THREADS" -ax "$MINIMAP2_PRESET" --secondary=no "${reference}.mmi" "$@" \
+  input_count=$(fastq_read_count "$input")
+  minimap2 -t "$THREADS" -ax "$MINIMAP2_PRESET" --secondary=no "${reference}.mmi" "$input" \
     2> "$raw_log" | samtools view -h -F 2304 -o "$sam" -
-  if [[ "$READ_LAYOUT" == "paired" ]]; then
-    samtools fastq -@ "$THREADS" -f 12 -1 "$unmapped1" -2 "$unmapped2" \
-      -0 /dev/null -s /dev/null -n "$sam" 2>> "$raw_log"
-  else
-    samtools fastq -@ "$THREADS" -f 4 -0 "$unmapped1" -s /dev/null -n "$sam" 2>> "$raw_log"
-  fi
-  unmapped_count=$(fastq_read_count "$unmapped1")
+  samtools fastq -@ "$THREADS" -f 4 -0 "$unmapped" -s /dev/null -n "$sam" 2>> "$raw_log"
+  unmapped_count=$(fastq_read_count "$unmapped")
   aligned_count=$((input_count - unmapped_count))
   printf 'metric\tcount\ninput\t%s\naligned\t%s\nunmapped\t%s\n' \
     "$input_count" "$aligned_count" "$unmapped_count" > "$report"
 }
 
 # Map to bacterial decoys and pass only primary-unmapped reads onward.
-decoy_r1=(); decoy_r2=()
-for idx in "${!trim_r1[@]}"; do
-  i="${trim_r1[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
+decoy_unmapped_fastqs=()
+for idx in "${!trimmed_fastqs[@]}"; do
+  i="${trimmed_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
   echo "mapping to bacterial decoys with minimap2: $i_basename ..."
-  unmapped1="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs.fastq.gz"
-  unmapped2="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs_R2.fastq.gz"
-  inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${trim_r2[$idx]}")
+  unmapped="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs.fastq.gz"
   minimap2_stage "$DECOY_MINIMAP2_REFERENCE" \
     "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.sam" \
     "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.minimap2.txt" \
-    "$unmapped1" "$unmapped2" "$i" "${inputs[@]}"
-  decoy_r1+=("$unmapped1"); [[ "$READ_LAYOUT" == "paired" ]] && decoy_r2+=("$unmapped2")
+    "$unmapped" "$i"
+  decoy_unmapped_fastqs+=("$unmapped")
 done
 
 # Map decoy-unmapped reads to the target bacterium.
-HOST_trim_filenames=(); HOST_trim_mates=()
-for idx in "${!decoy_r1[@]}"; do
-  i="${decoy_r1[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
+host_input_fastqs=()
+for idx in "${!decoy_unmapped_fastqs[@]}"; do
+  i="${decoy_unmapped_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
   echo "mapping to the bacterial reference with minimap2: $i_basename ..."
   host_input="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria.fastq.gz"
-  host_mate="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria_R2.fastq.gz"
-  inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${decoy_r2[$idx]}")
   minimap2_stage "$BACTERIA_MINIMAP2_REFERENCE" \
     "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" \
     "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.minimap2.txt" \
-    "$host_input" "$host_mate" "$i" "${inputs[@]}"
-  HOST_trim_filenames+=("$host_input"); [[ "$READ_LAYOUT" == "paired" ]] && HOST_trim_mates+=("$host_mate")
+    "$host_input" "$i"
+  host_input_fastqs+=("$host_input")
 done
 
 BACTERIA_sam_filenames=("$BACTERIA_ALIGNMENT_DIR"/BACTERIA*.sam)
 
 # Optionally classify reads that mapped to neither decoys nor bacteria as host.
 if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
-  for idx in "${!HOST_trim_filenames[@]}"; do
-    i="${HOST_trim_filenames[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
+  for idx in "${!host_input_fastqs[@]}"; do
+    i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
     echo "mapping to the host reference with minimap2: $i_basename ..."
-    inputs=("$i"); [[ "$READ_LAYOUT" == "paired" ]] && inputs+=("${HOST_trim_mates[$idx]}")
     minimap2_stage "$HOST_MINIMAP2_REFERENCE" \
       "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
       "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.minimap2.txt" \
-      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host.fastq.gz" \
-      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host_R2.fastq.gz" \
-      "$i" "${inputs[@]}"
+      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host.fastq.gz" "$i"
   done
 fi
 
 # Create featureCounts summary file.
 # Assign mapped reads to bacterial genes, retaining the pipeline's stranded and
 # overlapping-feature behavior.
-featurecounts_pair_args=(); [[ "$READ_LAYOUT" == "paired" ]] && featurecounts_pair_args=(-p --countReadPairs)
-featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -O -s 1 "${featurecounts_pair_args[@]}" -g "$BACTERIA_GENE_ATTRIBUTE" -t CDS \
+featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -O -s 1 -g "$BACTERIA_GENE_ATTRIBUTE" -t CDS \
   -o "$OUTPUT_DIR/featurecounts_BACTERIA_summary.txt" "${BACTERIA_sam_filenames[@]}"
 sed 's/\t/,/g' "$OUTPUT_DIR/featurecounts_BACTERIA_summary.txt" > "$OUTPUT_DIR/featurecounts_BACTERIA_summary.csv"
 # Count alignments assigned to an rRNA annotation separately.  The generated
 # .summary file supplies the non-duplicated Assigned total used by the read
 # disposition CSV; all other bacterial alignments are reported as non-rRNA.
-featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -s 1 "${featurecounts_pair_args[@]}" -g "$BACTERIA_GENE_ATTRIBUTE" -t rRNA \
+featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -s 1 -g "$BACTERIA_GENE_ATTRIBUTE" -t rRNA \
   -o "$OUTPUT_DIR/featurecounts_BACTERIA_rRNA.txt" "${BACTERIA_sam_filenames[@]}"
 
 # When a host reference is configured, independently assign host alignments to
 # its CDS features and keep the results alongside the host minimap2 outputs.
 if [[ -n "$HOST_GFF" ]]; then
   HOST_sam_filenames=("$HOST_ALIGNMENT_DIR"/HOST_*.sam)
-  featureCounts -T "$THREADS" -a "$HOST_GFF" -O -s 1 "${featurecounts_pair_args[@]}" -g "$HOST_GENE_ATTRIBUTE" -t CDS \
+  featureCounts -T "$THREADS" -a "$HOST_GFF" -O -s 1 -g "$HOST_GENE_ATTRIBUTE" -t CDS \
     -o "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.txt" "${HOST_sam_filenames[@]}"
   sed 's/\t/,/g' "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.txt" \
     > "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.csv"
-  featureCounts -T "$THREADS" -a "$HOST_GFF" -s 1 "${featurecounts_pair_args[@]}" -g "$HOST_GENE_ATTRIBUTE" -t rRNA \
+  featureCounts -T "$THREADS" -a "$HOST_GFF" -s 1 -g "$HOST_GENE_ATTRIBUTE" -t rRNA \
     -o "$HOST_ALIGNMENT_DIR/featurecounts_HOST_rRNA.txt" "${HOST_sam_filenames[@]}"
 fi
 
@@ -405,7 +330,6 @@ do
       --min-feature-reads "$METAGENE_MIN_FEATURE_READS"
       --output-prefix "$BACTERIA_ALIGNMENT_DIR/${i_basename}"
     )
-    [[ "$READ_LAYOUT" == "paired" ]] && profile_args+=(--paired)
     python3 "$SCRIPT_DIR/gene_position_profile.py" "${profile_args[@]}"
 done
 

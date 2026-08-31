@@ -31,10 +31,10 @@ def report_number(report, pattern, path):
 def cutadapt_counts(path):
     report = path.read_text()
     total = report_number(
-        report, r"Total (?:read pairs|reads) processed:\s*([\d,]+)", path
+        report, r"Total reads processed:\s*([\d,]+)", path
     )
     passing = report_number(
-        report, r"(?:Pairs|Reads) written \(passing filters\):\s*([\d,]+)", path
+        report, r"Reads written \(passing filters\):\s*([\d,]+)", path
     )
     return total, passing
 
@@ -128,8 +128,8 @@ def build_table(output_dir):
             "Leftover reads": passing - decoy_aligned - bacteria_aligned - host_aligned,
         }
         sources = {
-            "Total reads": f"{cutadapt_path.name}: Total reads/read pairs processed",
-            "Reads passing cutadapt length filter": f"{cutadapt_path.name}: Reads/pairs written (passing filters)",
+            "Total reads": f"{cutadapt_path.name}: Total reads processed",
+            "Reads passing cutadapt length filter": f"{cutadapt_path.name}: Reads written (passing filters)",
             "Decoy aligned": f"{decoy_path.relative_to(output_dir)}: pipeline primary-alignment count",
             "Bacteria aligned": f"{bacteria_path.relative_to(output_dir)}: pipeline primary-alignment count",
             "Bacteria rRNA": f"{bacteria_rrna_path.relative_to(output_dir)}: Assigned",
