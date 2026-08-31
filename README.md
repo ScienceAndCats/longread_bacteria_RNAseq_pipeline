@@ -7,7 +7,7 @@ This repository contains a long-read FASTQ processing pipeline for bacterial seq
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses `cutadapt` to remove the configured long-read adapter sequence and discard reads shorter than the configured minimum length.
+2. Uses `cutadapt` to remove the configured long-read adapter sequence and discard reads shorter than the configured minimum length. When enabled, a second Cutadapt pass removes standard Illumina and Illumina small-RNA kit adapters without discarding reads that lack those adapters.
 3. Uses `minimap2` to map trimmed reads to a decoy/pangenome index and keeps reads that do **not** map to the decoys.
 4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index.
 5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
@@ -58,6 +58,9 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `HOST_MINIMAP2_REFERENCE` | Optional shared basename for the host index (or FASTA) and GFF annotation; leave empty to disable host mapping and counting. |
 | `MINIMAP2_PRESET` | Long-read minimap2 preset: `map-ont` (default), `map-hifi`, or `map-pb`. Other presets are rejected. |
 | `ADAPTER_NANOPORE` | Long-read adapter passed to cutadapt; defaults to the Oxford Nanopore ligation adapter and may be changed for another library preparation. |
+| `TRIM_ILLUMINA_ADAPTERS` | Set to `true` to run an optional second Cutadapt pass for standard Illumina and small-RNA kit adapters; unmatched reads are retained. |
+| `ADAPTER_ILLUMINA` | Standard Illumina 3' adapter used by the optional second trimming pass. |
+| `ADAPTER_ILLUMINA_SMALL_RNA` | Illumina small-RNA kit 3' adapter used by the optional second trimming pass. |
 | `MIN_READ_LENGTH` | Minimum read length retained by cutadapt. |
 | `THREADS` | Number of threads used by every multithreaded step (default: `16`). |
 | `GENE_POSITION_BINS` | Number of equal normalized 5'-to-3' bins (default: `100`). |
@@ -69,6 +72,8 @@ Edit `config.env` before running the pipeline. The key settings are:
 Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before trimming or mapping, the pipeline uses reservoir sampling to select up to `SAMPLE_SIZE` complete long-read records from each input. Files with 5,000 reads or fewer are used in full with the default setting. The temporary sampled inputs are written under `OUTPUT_DIR/.bacteria_sampled_fastq`; original FASTQ files are never modified. Sampling is reproducible for the same input paths and `SAMPLE_SEED`. Set `SAMPLE_READS="false"` for a full analysis.
 
 The minimap2 reference settings are basenames, not individual `.mmi` files. For example, configure `/refs/bacteria_reference`; the pipeline reuses `/refs/bacteria_reference.mmi`, or builds it from `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
+
+Set `TRIM_ILLUMINA_ADAPTERS="true"` for libraries that may also contain Illumina-derived adapters. After Nanopore trimming and length filtering, Cutadapt searches each surviving read for both the standard Illumina adapter and the Illumina small-RNA kit adapter. It makes up to two trimming rounds so both adapter types can be removed from the same read. Because the pass does not use `--discard-untrimmed`, reads are retained whether or not either adapter is detected. Its per-sample report is written to `*_illumina_adapter_log.txt`; the final `*.trim.fastq` is the input to minimap2.
 
 To enable host mapping and feature counting, set `HOST_MINIMAP2_REFERENCE` to the shared host reference basename and provide its FASTA/index and matching `.gff*` annotation. Setting it to `""` skips host index preparation, alignment, and counting. Host input consists exclusively of reads that did not align to either the decoy or bacterial reference.
 

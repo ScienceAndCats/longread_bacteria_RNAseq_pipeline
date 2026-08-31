@@ -22,6 +22,9 @@ source "$CONFIG_FILE"
 : "${HOST_MINIMAP2_REFERENCE:=}"
 : "${MINIMAP2_PRESET:=map-ont}"
 : "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
+: "${TRIM_ILLUMINA_ADAPTERS:=false}"
+: "${ADAPTER_ILLUMINA:=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA}"
+: "${ADAPTER_ILLUMINA_SMALL_RNA:=TGGAATTCTCGGGTGCCAAGG}"
 : "${MIN_READ_LENGTH:=22}"
 : "${THREADS:=16}"
 : "${GENE_POSITION_BINS:=100}"
@@ -34,6 +37,10 @@ source "$CONFIG_FILE"
 case "$MINIMAP2_PRESET" in
   map-ont|map-hifi|map-pb) ;;
   *) echo "MINIMAP2_PRESET must be a long-read preset: map-ont, map-hifi, or map-pb" >&2; exit 1 ;;
+esac
+case "${TRIM_ILLUMINA_ADAPTERS,,}" in
+  true|false) ;;
+  *) echo "TRIM_ILLUMINA_ADAPTERS must be true or false" >&2; exit 1 ;;
 esac
 
 shopt -s nullglob
@@ -223,6 +230,16 @@ for input_fastq in "${fastq_files[@]}"; do
   cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_NANOPORE" \
     -o "$trimmed_fastq" "$input_fastq" \
     > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
+  if [[ "${TRIM_ILLUMINA_ADAPTERS,,}" == "true" ]]; then
+    illumina_trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.illumina_trim.fastq"
+    # Search twice so a standard and a small-RNA adapter can both be removed
+    # from one read. Cutadapt keeps reads for which neither adapter is found.
+    cutadapt -j "$THREADS" --times 2 \
+      -a "$ADAPTER_ILLUMINA" -a "$ADAPTER_ILLUMINA_SMALL_RNA" \
+      -o "$illumina_trimmed_fastq" "$trimmed_fastq" \
+      > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.illumina_adapter_log.txt"
+    mv -- "$illumina_trimmed_fastq" "$trimmed_fastq"
+  fi
   trimmed_fastqs+=("$trimmed_fastq"); sample_names+=("$sample")
 done
 
