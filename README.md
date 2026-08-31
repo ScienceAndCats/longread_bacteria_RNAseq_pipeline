@@ -1,13 +1,13 @@
 # Whiteley Bacteria Mapping Pipeline
 
-This repository contains an Oxford Nanopore long-read FASTQ processing pipeline (with paired-read compatibility) for bacterial sequencing runs. The pipeline trims adapters, removes reads that map to a decoy/pangenome reference, maps the remaining reads to a configurable bacterial reference genome, counts gene-level alignments, calculates bacterial coverage metrics, and writes a project-level CSV summary.
+This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, removes reads that map to a decoy/pangenome reference, maps the remaining reads to a configurable bacterial reference genome, counts gene-level alignments, calculates bacterial coverage metrics, and writes a project-level CSV summary.
 
 ## What the program does
 
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses `cutadapt` to remove configured Illumina and Oxford Nanopore adapter sequences and discard reads shorter than the configured minimum length.
+2. Uses `cutadapt` to remove the configured long-read adapter sequence and discard reads shorter than the configured minimum length.
 3. Uses `minimap2` to map trimmed reads to a decoy/pangenome index and keeps reads that do **not** map to the decoys.
 4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index.
 5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
@@ -49,7 +49,6 @@ Edit `config.env` before running the pipeline. The key settings are:
 | --- | --- |
 | `FASTQ_DIR` | Directory containing input FASTQ files. |
 | `FASTQ_GLOB` | Shell glob for FASTQ inputs, such as `*.fastq`. |
-| `READ_LAYOUT` | `single` (default) or `paired`; paired files may be named `<sample>_R1.fastq[.gz]` and `<sample>_R2.fastq[.gz]`, or include the same suffix after the read marker (for example, `_R1_001` and `_R2_001`). |
 | `OUTPUT_DIR` | Directory where output files should be written. |
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
 | `SAMPLE_SIZE` | Maximum reads sampled from each FASTQ (default: `5000`). |
@@ -57,22 +56,17 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `DECOY_MINIMAP2_REFERENCE` | Minimap2 reference basename for the decoy/pangenome reference. |
 | `BACTERIA_MINIMAP2_REFERENCE` | Shared basename for the bacterial minimap2 index (or FASTA) and GFF annotation. |
 | `HOST_MINIMAP2_REFERENCE` | Optional shared basename for the host index (or FASTA) and GFF annotation; leave empty to disable host mapping and counting. |
-| `MINIMAP2_PRESET` | Minimap2 preset, defaulting to `map-ont` for Oxford Nanopore reads. |
-| `ADAPTER_SINGLE`, `ADAPTER_NANOPORE` | Illumina and Nanopore adapters both passed to cutadapt for single long reads. |
-| `ADAPTER_R1`, `ADAPTER_R2` | Mate-specific paired-end adapters (both default to `CTGTCTCTTATACACATCT`). |
+| `MINIMAP2_PRESET` | Long-read minimap2 preset: `map-ont` (default), `map-hifi`, or `map-pb`. Other presets are rejected. |
+| `ADAPTER_NANOPORE` | Long-read adapter passed to cutadapt; defaults to the Oxford Nanopore ligation adapter and may be changed for another library preparation. |
 | `MIN_READ_LENGTH` | Minimum read length retained by cutadapt. |
 | `THREADS` | Number of threads used by every multithreaded step (default: `16`). |
 | `GENE_POSITION_BINS` | Number of equal normalized 5'-to-3' bins (default: `100`). |
-| `METAGENE_MIN_FEATURE_READS` | Assigned reads/fragments required for a feature to contribute to aggregate profiles (default: `10`). |
+| `METAGENE_MIN_FEATURE_READS` | Assigned reads required for a feature to contribute to aggregate profiles (default: `10`). |
 | `CSV_CONVERSION_SCRIPT` | Path to `bacteria_with_decoys_csvConversion.py`. |
 
 ### Quick sampling mode
 
-Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before trimming or mapping, the pipeline uses reservoir sampling to select up to `SAMPLE_SIZE` complete read records. For paired input it selects the same record positions from both mates and verifies that their record counts agree. Files with 5,000 reads or fewer are used in full with the default setting. The temporary sampled inputs are written under `OUTPUT_DIR/.bacteria_sampled_fastq`; original FASTQ files are never modified. Sampling is reproducible for the same input paths and `SAMPLE_SEED`. Set `SAMPLE_READS="false"` for a full analysis.
-
-### Paired-end input
-
-Nanopore data should normally use the default `READ_LAYOUT="single"`. Legacy paired input remains supported: set `READ_LAYOUT="paired"`, set `MINIMAP2_PRESET="sr"`, and provide matching `_R1`/`_R2` files. Cutadapt receives both mates, each minimap2 stage receives both FASTQs, and featureCounts counts fragments rather than individual mates.
+Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before trimming or mapping, the pipeline uses reservoir sampling to select up to `SAMPLE_SIZE` complete long-read records from each input. Files with 5,000 reads or fewer are used in full with the default setting. The temporary sampled inputs are written under `OUTPUT_DIR/.bacteria_sampled_fastq`; original FASTQ files are never modified. Sampling is reproducible for the same input paths and `SAMPLE_SEED`. Set `SAMPLE_READS="false"` for a full analysis.
 
 The minimap2 reference settings are basenames, not individual `.mmi` files. For example, configure `/refs/bacteria_reference`; the pipeline reuses `/refs/bacteria_reference.mmi`, or builds it from `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
 
@@ -94,7 +88,7 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 
 ## Important outputs
 
-- `*_22bp.trim.fastq` (single) or `*_R{1,2}_22bp.trim.fastq` (paired) — adapter-trimmed FASTQ files.
+- `*_22bp.trim.fastq` — adapter-trimmed long-read FASTQ files.
 - `minimap2_alignments/decoy/` — decoy SAM files, minimap2 reports and diagnostic logs, and decoy-unmapped reads.
 - `minimap2_alignments/bacteria/` — bacterial SAM/BAM files, minimap2 logs, and coverage reports.
 - `minimap2_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.
@@ -102,7 +96,7 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 - `featurecounts_BACTERIA_summary.txt` and `featurecounts_BACTERIA_summary.csv` — featureCounts results.
 - `minimap2_alignments/host/featurecounts_HOST_summary.txt` and `.csv` — optional, separate host featureCounts results.
 - `minimap2_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools coverage reports.
-- `minimap2_alignments/bacteria/BACTERIA_*.feature_read_positions.csv` — unique per-read/per-fragment positions and explicitly flagged ambiguous overlaps.
+- `minimap2_alignments/bacteria/BACTERIA_*.feature_read_positions.csv` — unique per-read positions and explicitly flagged ambiguous overlaps.
 - `minimap2_alignments/bacteria/BACTERIA_*.feature_position_bins.csv` — read counts and within-feature fractions for every feature and normalized bin.
 - `minimap2_alignments/bacteria/BACTERIA_*.metagene_{CDS,non_CDS}_profile.csv` and `.png` — separate protein-coding and noncoding aggregate profiles.
 - `minimap2_alignments/bacteria/BACTERIA_*.metagene_non_CDS_by_type.csv` and `.png` — subtype profiles (for example rRNA, tRNA, ncRNA, tmRNA, and other).
@@ -113,12 +107,12 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 
 ## Notes
 
-- Input files must end in `.fastq` or `.fastq.gz`; use `FASTQ_GLOB` to narrow which files are selected.
+- Input files must contain one long molecule per FASTQ record and end in `.fastq` or `.fastq.gz`; use `FASTQ_GLOB` to narrow which files are selected.
 - Ensure the configured bacterial reference and annotation use compatible genome versions.
 
 ## Normalized feature-position analysis
 
-The post-alignment analysis collapses differently sized annotated features onto a common biological coordinate: **0% is the 5' end and 100% is the 3' end**. It follows genomic start-to-end on `+` features and reverses genomic coordinates on `-` features. Single-end observations use the midpoint of the aligned portion. In paired mode, the complete aligned fragment midpoint is used and the pair is counted once. Unmapped, secondary, and supplementary alignments are ignored; duplicates are not filtered.
+The post-alignment analysis collapses differently sized annotated features onto a common biological coordinate: **0% is the 5' end and 100% is the 3' end**. It follows genomic start-to-end on `+` features and reverses genomic coordinates on `-` features. Each long-read observation uses the midpoint of its aligned portion. Unmapped, secondary, and supplementary alignments are ignored; duplicates are not filtered.
 
 Protein-coding loci (`CDS`) use the complete parent gene interval when the annotation hierarchy provides it (falling back to the combined CDS extent). Ordinary `gene` records are never treated as noncoding merely because they lack a CDS type. Non-CDS loci come from biologically informative RNA annotations such as rRNA, tRNA, tmRNA, ncRNA, sRNA, misc_RNA, and snRNA, with RNA children preferred over their generic gene parents. Subtype aggregates prevent abundant rRNA from silently dominating every noncoding comparison.
 

@@ -55,8 +55,8 @@ readsWrittenList = []
 for file in cutadaptFiles:
     with open(file, "r") as f:
         report = f.read()
-    raw_match = re.search(r"Total (?:read pairs|reads) processed:\s*([\d,]+)", report)
-    written_match = re.search(r"(?:Pairs|Reads) written \(passing filters\):\s*([\d,]+)", report)
+    raw_match = re.search(r"Total reads processed:\s*([\d,]+)", report)
+    written_match = re.search(r"Reads written \(passing filters\):\s*([\d,]+)", report)
     if not raw_match or not written_match:
         raise ValueError(f"Could not parse cutadapt report: {file}")
     rawReadsList.append(raw_match.group(1).replace(',', ''))
@@ -91,8 +91,8 @@ readsWrittenList = []
 for file in cutadaptFiles:
     with open(file, "r") as f:
         report = f.read()
-    raw_match = re.search(r"Total (?:read pairs|reads) processed:\s*([\d,]+)", report)
-    written_match = re.search(r"(?:Pairs|Reads) written \(passing filters\):\s*([\d,]+)", report)
+    raw_match = re.search(r"Total reads processed:\s*([\d,]+)", report)
+    written_match = re.search(r"Reads written \(passing filters\):\s*([\d,]+)", report)
     if not raw_match or not written_match:
         raise ValueError(f"Could not parse cutadapt report: {file}")
     rawReadsList.append(raw_match.group(1).replace(',', ''))
