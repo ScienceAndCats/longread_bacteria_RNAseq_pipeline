@@ -9,7 +9,7 @@ This repository contains a long-read FASTQ processing pipeline for bacterial seq
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
 2. Uses `cutadapt` to remove the configured long-read adapter sequence and discard reads shorter than the configured minimum length. When enabled, a second Cutadapt pass removes standard Illumina and Illumina small-RNA kit adapters without discarding reads that lack those adapters.
 3. Uses `minimap2` to map trimmed reads to a decoy/pangenome index and keeps reads that do **not** map to the decoys.
-4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index.
+4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index. It saves a final leftover FASTQ containing reads that failed every configured alignment stage, whether or not host mapping is enabled.
 5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
 6. Uses `samtools` to create, sort, index, and calculate coverage from BAM files.
 7. Uses `gene_position_profile.py` on each sorted bacterial BAM to calculate strand-aware, normalized feature-position and aggregate metagene profiles.
@@ -98,6 +98,7 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 - `minimap2_alignments/bacteria/` — bacterial SAM/BAM files, minimap2 logs, and coverage reports.
 - `minimap2_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.
 - `minimap2_alignments/host/` — optional host SAM files, minimap2 logs, and host featureCounts results.
+- `minimap2_alignments/leftover_reads/*_leftover.fastq.gz` — final reads that mapped to none of the configured decoy, bacterial, or host references. These files are always created; when host mapping is disabled, they contain the bacterial-unmapped reads.
 - `featurecounts_BACTERIA_summary.txt` and `featurecounts_BACTERIA_summary.csv` — featureCounts results.
 - `minimap2_alignments/host/featurecounts_HOST_summary.txt` and `.csv` — optional, separate host featureCounts results.
 - `minimap2_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools coverage reports.
