@@ -111,7 +111,8 @@ ALIGNMENT_DIR="$OUTPUT_DIR/minimap2_alignments"
 DECOY_ALIGNMENT_DIR="$ALIGNMENT_DIR/decoy"
 BACTERIA_ALIGNMENT_DIR="$ALIGNMENT_DIR/bacteria"
 HOST_ALIGNMENT_DIR="$ALIGNMENT_DIR/host"
-mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR"
+LEFTOVER_READS_DIR="$ALIGNMENT_DIR/leftover_reads"
+mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR" "$LEFTOVER_READS_DIR"
 if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
   mkdir -p "$HOST_ALIGNMENT_DIR"
 fi
@@ -293,7 +294,9 @@ done
 
 BACTERIA_sam_filenames=("$BACTERIA_ALIGNMENT_DIR"/BACTERIA*.sam)
 
-# Optionally classify reads that mapped to neither decoys nor bacteria as host.
+# Save the reads left after all configured classification stages under one
+# stable name. With no host reference, the bacterial-unmapped reads are already
+# the final leftovers; otherwise, write the host-unmapped reads there directly.
 if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
   for idx in "${!host_input_fastqs[@]}"; do
     i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
@@ -301,7 +304,12 @@ if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
     minimap2_stage "$HOST_MINIMAP2_REFERENCE" \
       "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
       "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.minimap2.txt" \
-      "$HOST_ALIGNMENT_DIR/${i_basename}_unmapped_to_host.fastq.gz" "$i"
+      "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz" "$i"
+  done
+else
+  for idx in "${!host_input_fastqs[@]}"; do
+    i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
+    cp -- "$i" "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz"
   done
 fi
 
