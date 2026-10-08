@@ -7,7 +7,7 @@ This repository contains a long-read FASTQ processing pipeline for bacterial seq
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses `cutadapt` to remove the configured long-read adapter sequence and discard reads shorter than the configured minimum length. When enabled, a second Cutadapt pass removes standard Illumina and Illumina small-RNA kit adapters without discarding reads that lack those adapters.
+2. Uses Cutadapt to trim adapters in the configured `legacy` or `neb_e7330` mode, then applies the minimum read length. NEB mode extracts both flanks in either orientation and cleans repeated terminal adapters. Reads lacking adapters or having only one confirmed flank are retained if they pass the final length filter.
 3. Uses `minimap2` to map trimmed reads to a decoy/pangenome index and keeps reads that do **not** map to the decoys.
 4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index. It saves a final leftover FASTQ containing reads that failed every configured alignment stage, whether or not host mapping is enabled.
 5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
@@ -22,10 +22,10 @@ The summary conversion scripts use only the Python standard library. Positional 
 
 The pipeline environment pins these command-line tools:
 
-- Python 3.13.5
-- cutadapt 5.1
+- Python 3.13.15
+- cutadapt 5.2 (NEB mode uses its rightmost 3' adapter matching)
 - minimap2 2.30
-- samtools 1.22.1
+- samtools 1.24
 - Subread / featureCounts 2.1.1
 - pysam
 - matplotlib
@@ -36,7 +36,7 @@ A conda environment file is provided in `environment.yml`.
 
 ```bash
 conda env create -f environment.yml
-conda activate whiteley-bacteria-pipeline
+conda activate bacteria-RNAseq-pipeline
 ```
 
 If you are running on an HPC system that requires module loading, load your site-specific conda or mamba module before creating or activating the environment.
@@ -57,11 +57,20 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `BACTERIA_MINIMAP2_REFERENCE` | Shared basename for the bacterial minimap2 index (or FASTA) and GFF annotation. |
 | `HOST_MINIMAP2_REFERENCE` | Optional shared basename for the host index (or FASTA) and GFF annotation; leave empty to disable host mapping and counting. |
 | `MINIMAP2_PRESET` | Long-read minimap2 preset: `map-ont` (default), `map-hifi`, or `map-pb`. Other presets are rejected. |
+| `ADAPTER_TRIMMING_MODE` | `legacy` (default) or `neb_e7330` for NEBNext E7330S Illumina libraries sequenced with Nanopore. |
+| `CUTADAPT_ERROR_RATE` | Maximum adapter alignment error rate (default: `0.15`); mismatches and indels are allowed. |
+| `CUTADAPT_MIN_OVERLAP` | Minimum adapter overlap, in nucleotides (default: `12`). |
+| `ADAPTER_MAX_TRIMMING_ROUNDS` | NEB mode round limit (default: `10`), including initial flank extraction. |
+| `ADAPTER_NEB_5P`, `ADAPTER_NEB_3P` | NEB E7330S 5' and 3' flanks in the insert's forward orientation. |
+| `TRIM_NANOPORE_ADAPTERS` | Enable Nanopore adapter removal (default: `true`); NEB mode limits it to terminal matches on incompletely bounded reads. |
 | `ADAPTER_NANOPORE` | Long-read adapter passed to cutadapt; defaults to the Oxford Nanopore ligation adapter and may be changed for another library preparation. |
-| `TRIM_ILLUMINA_ADAPTERS` | Set to `true` to run an optional second Cutadapt pass for standard Illumina and small-RNA kit adapters; unmatched reads are retained. |
+| `ADAPTER_NANOPORE_RC` | Its reverse complement; leave empty to compute it in NEB mode when customizing the adapter. |
+| `TRIM_TRUSEQ_SMALL_RNA` | NEB mode opt-in for terminal TruSeq small-RNA adapter removal (default: `false`). |
+| `ADAPTER_TRUSEQ_SMALL_RNA` | Optional other-kit adapter `TGGAATTCTCGGGTGCCAAGG`. |
+| `TRIM_ILLUMINA_ADAPTERS` | Legacy mode only: optional second Cutadapt pass for standard Illumina and small-RNA kit adapters; unmatched reads are retained. |
 | `ADAPTER_ILLUMINA` | Standard Illumina 3' adapter used by the optional second trimming pass. |
 | `ADAPTER_ILLUMINA_SMALL_RNA` | Illumina small-RNA kit 3' adapter used by the optional second trimming pass. |
-| `MIN_READ_LENGTH` | Minimum read length retained by cutadapt. |
+| `MIN_READ_LENGTH` | Minimum retained length **after all trimming** (default: `20`). Existing project configs with explicit values such as `22` keep that value. |
 | `THREADS` | Number of threads used by every multithreaded step (default: `16`). |
 | `GENE_POSITION_BINS` | Number of equal normalized 5'-to-3' bins (default: `100`). |
 | `METAGENE_MIN_FEATURE_READS` | Assigned reads required for a feature to contribute to aggregate profiles (default: `10`). |
@@ -73,7 +82,105 @@ Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before tr
 
 The minimap2 reference settings are basenames, not individual `.mmi` files. For example, configure `/refs/bacteria_reference`; the pipeline reuses `/refs/bacteria_reference.mmi`, or builds it from `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
 
-Set `TRIM_ILLUMINA_ADAPTERS="true"` for libraries that may also contain Illumina-derived adapters. After Nanopore trimming and length filtering, Cutadapt searches each surviving read for both the standard Illumina adapter and the Illumina small-RNA kit adapter. It makes up to two trimming rounds so both adapter types can be removed from the same read. Because the pass does not use `--discard-untrimmed`, reads are retained whether or not either adapter is detected. Its per-sample report is written to `*_illumina_adapter_log.txt`; the final `*.trim.fastq` is the input to minimap2.
+In `legacy` mode, set `TRIM_ILLUMINA_ADAPTERS="true"` for libraries that may also contain Illumina-derived adapters. Cutadapt first removes the configured Nanopore 3' adapter, then searches for the standard Illumina and Illumina small-RNA adapters in up to two rounds. The minimum length is applied after both passes. Adapter choices and unmatched-read retention remain compatible with existing configurations; the new error/overlap defaults are `0.15`/`12` (set `0.1`/`3` to recover the old matching tolerance). The Nanopore and optional Illumina reports are `*_nanopore_adapter_log.txt` and `*_illumina_adapter_log.txt`; `*_cutadapt_log.txt` and `*.cutadapt.json` report the final length-filter pass.
+
+### NEBNext E7330S libraries sequenced using Nanopore
+
+For NEBNext Small RNA Library Prep Set for Illumina (E7330S) libraries, including Plasmidsaurus Premium PCR sequencing, configure:
+
+```bash
+ADAPTER_TRIMMING_MODE="neb_e7330"
+ADAPTER_NEB_5P="GTTCAGAGTTCTACAGTCCGACGATC"
+ADAPTER_NEB_3P="AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+CUTADAPT_ERROR_RATE="0.15"
+CUTADAPT_MIN_OVERLAP="12"
+ADAPTER_MAX_TRIMMING_ROUNDS="10"
+MIN_READ_LENGTH="20"  # use 22 if required by your analysis
+TRIM_NANOPORE_ADAPTERS="true"
+TRIM_TRUSEQ_SMALL_RNA="false"
+```
+
+`trim_neb_adapters.py` streams FASTQ through Cutadapt's existing adapter parser,
+`AdapterCutter`, and `ReverseComplementer`, which implement `-g`/`-a`, `--times`,
+and `--revcomp`. It needs no dependencies beyond those installed with Cutadapt.
+Matching is performed in one process; `THREADS` still controls the legacy
+Cutadapt commands and downstream multithreaded tools.
+
+1. Find a linked `-g '5P...3P;rightmost'` match requiring both flanks, testing
+   the read and its reverse complement with Cutadapt's `--revcomp` engine.
+   Keep the span between the leftmost best 5' match and rightmost best 3' match.
+   This single linked extraction removes both outer flanks, including any
+   preceding/following PCR primer, index, P5/P7 or Nanopore sequence. Read
+   orientation is normalized to the supplied forward NEB adapters.
+2. Clean exposed ends using non-internal `-g X5P` and `-a 3PX` matching with
+   `--times 2` per cleanup round. The literal `X` disallows internal matches
+   while allowing partial adapters at the read ends. Consecutive 5' and/or 3'
+   copies are removed until no terminal matches remain or the total round
+   budget is reached. This avoids a broad repeated search through the insert.
+3. Without a linked match, retain reads and try terminal NEB matches, using
+   `--revcomp` until a NEB flank establishes orientation. Optional terminal
+   Nanopore cleanup recognizes both `ADAPTER_NANOPORE` and its reverse
+   complement at either end; these matches never determine insert orientation.
+   Complete NEB constructs receive no additional Nanopore pass, protecting
+   Nanopore-like motifs within the bounded insert.
+4. Apply `MIN_READ_LENGTH` only after these operations. IDs and header comments
+   are unchanged; qualities are sliced with their bases and reversed when a
+   read is reverse-complemented. Plain and gzipped FASTQ input are supported.
+
+A single confirmed flank is labeled `5p_only` or `3p_only`, **not** a fully
+bounded biological insert. If the only NEB motif is internal and its outer
+sequence cannot be bounded, the read is left intact and its remaining motif
+is reported. Terminal cleanup does not guess which unknown bases are adapters.
+TruSeq small-RNA sequence is excluded by default; enable
+`TRIM_TRUSEQ_SMALL_RNA` explicitly for terminal matching from that kit.
+`TRIM_ILLUMINA_ADAPTERS` applies only to legacy mode.
+
+An internal 3'-adapter followed by a 5'-adapter is flagged
+`ambiguous_concatemer=1`. The bounded span is retained unsplit, with its internal
+junction, for review; it still undergoes the final length filter. These reads
+and partial/unbounded reads remain in the FASTQ supplied to the unchanged
+mapping pipeline. Neither flag certifies a clean insert. A biological sequence
+identical to a terminal adapter (or to a complete library layout) cannot be
+distinguished from that adapter using sequence matching alone.
+
+NEB mode writes these files per sample, using the same `<sample>_<length>bp` prefix:
+
+| File | Contents |
+| --- | --- |
+| `*.cutadapt_log.txt` | Cutadapt version/settings and whole-operation counts, including final length filtering; compatible with existing summary readers. |
+| `*.adapter_stats.csv` | One row: total/detected/trimmed reads, both/single flanks, reverse complements, repeated adapters, multiple rounds, length discards, remaining motifs, round-limit hits, ambiguous concatemers, retained count and retained length minimum/maximum/mean. |
+| `*.adapter_reads.csv` | Per-read evidence and retention flags, including original header, lengths, flank match counts and ambiguity flags; read numbers disambiguate duplicate IDs. |
+| `*.read_lengths.csv` | Exact retained-read length distribution (`length,retained_reads`). |
+
+The NEB reports are generated from observed per-read Cutadapt match objects
+and final lengths, rather than estimates from marginal per-adapter totals.
+Both-flank counts require accepted matches to each NEB flank. Repeated-adapter
+counts require multiple accepted matches to the same adapter type; the initial
+linked extraction counts as one round removing two flanks, and each cleanup
+round removes up to two adapters. Counts include reads subsequently discarded
+by length, except fields explicitly labeled retained. `reads_with_adapters_detected`
+also includes diagnostic interior motif matches; `trimmed_reads` counts actual
+length changes. Remaining-motif counts include internal biological lookalikes
+and do not by themselves prove adapter contamination. A separate terminal
+remaining count identifies incomplete cleanup at the round limit.
+
+To trim a FASTQ without any reference mapping, run from the repository:
+
+```bash
+bash trim_fastq.sh config.env reads.fastq.gz trimmed.fastq sample_20bp
+```
+
+Run the synthetic regression suite in the pipeline environment:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+It covers 22-nt inserts in both orientations; two/three repeated copies on
+either/both sides; P5/P7, index and Nanopore outer flanks; substitutions,
+insertions and deletions; terminal partial adapters; dimers; reads without
+adapters; internal motifs; ambiguous concatemers; round limits; short/long
+inserts; exact qualities/headers; gzip/plain FASTQ; and legacy final filtering.
 
 To enable host mapping and feature counting, set `HOST_MINIMAP2_REFERENCE` to the shared host reference basename and provide its FASTA/index and matching `.gff*` annotation. Setting it to `""` skips host index preparation, alignment, and counting. Host input consists exclusively of reads that did not align to either the decoy or bacterial reference.
 
@@ -93,7 +200,7 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 
 ## Important outputs
 
-- `*_22bp.trim.fastq` — adapter-trimmed long-read FASTQ files.
+- `*_<MIN_READ_LENGTH>bp.trim.fastq` — adapter-trimmed FASTQ files after the final length filter.
 - `minimap2_alignments/decoy/` — decoy SAM files, minimap2 reports and diagnostic logs, and decoy-unmapped reads.
 - `minimap2_alignments/bacteria/` — bacterial SAM/BAM files, minimap2 logs, and coverage reports.
 - `minimap2_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.

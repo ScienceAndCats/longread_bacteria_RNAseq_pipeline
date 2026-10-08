@@ -25,7 +25,7 @@ source "$CONFIG_FILE"
 : "${TRIM_ILLUMINA_ADAPTERS:=false}"
 : "${ADAPTER_ILLUMINA:=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA}"
 : "${ADAPTER_ILLUMINA_SMALL_RNA:=TGGAATTCTCGGGTGCCAAGG}"
-: "${MIN_READ_LENGTH:=22}"
+: "${MIN_READ_LENGTH:=20}"
 : "${THREADS:=16}"
 : "${GENE_POSITION_BINS:=100}"
 : "${METAGENE_MIN_FEATURE_READS:=10}"
@@ -223,24 +223,13 @@ case "${SAMPLE_READS,,}" in
   *) echo "SAMPLE_READS must be true or false" >&2; exit 1 ;;
 esac
 
-# Trim the configured long-read adapter and discard reads below the minimum length.
+# Complete adapter trimming before applying the configured minimum length.
 trimmed_fastqs=(); sample_names=()
 for input_fastq in "${fastq_files[@]}"; do
   filename=$(basename "$input_fastq"); filename=${filename%.gz}; sample=${filename%.fastq}
   trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.trim.fastq"
-  cutadapt -m "$MIN_READ_LENGTH" -j "$THREADS" -a "$ADAPTER_NANOPORE" \
-    -o "$trimmed_fastq" "$input_fastq" \
-    > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.cutadapt_log.txt"
-  if [[ "${TRIM_ILLUMINA_ADAPTERS,,}" == "true" ]]; then
-    illumina_trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.illumina_trim.fastq"
-    # Search twice so a standard and a small-RNA adapter can both be removed
-    # from one read. Cutadapt keeps reads for which neither adapter is found.
-    cutadapt -j "$THREADS" --times 2 \
-      -a "$ADAPTER_ILLUMINA" -a "$ADAPTER_ILLUMINA_SMALL_RNA" \
-      -o "$illumina_trimmed_fastq" "$trimmed_fastq" \
-      > "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.illumina_adapter_log.txt"
-    mv -- "$illumina_trimmed_fastq" "$trimmed_fastq"
-  fi
+  bash "$SCRIPT_DIR/trim_fastq.sh" "$CONFIG_FILE" "$input_fastq" "$trimmed_fastq" \
+    "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp"
   trimmed_fastqs+=("$trimmed_fastq"); sample_names+=("$sample")
 done
 
