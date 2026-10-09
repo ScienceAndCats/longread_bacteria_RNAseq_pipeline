@@ -1,36 +1,37 @@
 # Whiteley Bacteria Mapping Pipeline
 
-This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, removes reads that map to a decoy/pangenome reference, maps the remaining reads to a configurable bacterial reference genome, counts gene-level alignments, calculates bacterial coverage metrics, and writes a project-level CSV summary.
+This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, separates reads over 6000 bp after trimming, uses BBSplit to remove reads that map to a decoy/pangenome reference and map the remaining eligible reads to a configurable bacterial reference genome, counts gene-level alignments, calculates bacterial coverage metrics, and writes project-level CSV summaries.
 
 ## What the program does
 
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses Cutadapt to trim adapters in the configured `legacy` or `neb_e7330` mode, then applies the minimum read length. NEB mode extracts both flanks in either orientation and cleans repeated terminal adapters. Reads lacking adapters or having only one confirmed flank are retained if they pass the final length filter.
-3. Uses `minimap2` to map trimmed reads to a decoy/pangenome index and keeps reads that do **not** map to the decoys.
-4. Uses `minimap2` with the `map-ont` preset again to map decoy-unmapped reads to the bacterial reference index, retaining the reads that also fail this second alignment. When `HOST_MINIMAP2_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host index. It saves a final leftover FASTQ containing reads that failed every configured alignment stage, whether or not host mapping is enabled.
+2. Uses Cutadapt to trim adapters in the configured `legacy` or `neb_e7330` mode, then applies the minimum read length. NEB mode extracts both flanks in either orientation and cleans repeated terminal adapters. Reads lacking adapters or having only one confirmed flank are retained if they pass the final length filter. After all trimming, reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
+3. Uses `bbsplit.sh` to map eligible trimmed reads to a decoy/pangenome reference and keeps reads that do **not** map to the decoys.
+4. Uses BBSplit again to map decoy-unmapped reads to the bacterial reference, retaining the reads that also fail this second alignment. When `HOST_BBSPLIT_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host reference. It saves a final leftover FASTQ containing reads that failed every configured alignment stage, whether or not host mapping is enabled. Every stage uses configurable `k` (default `11`) and fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000`, with `qtrim=f` to preserve the adapter-trimmed sequences and `interleaved=f` for single-read FASTQ input.
 5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
 6. Uses `samtools` to create, sort, index, and calculate coverage from BAM files.
 7. Uses `gene_position_profile.py` on each sorted bacterial BAM to calculate strand-aware, normalized feature-position and aggregate metagene profiles.
-8. Runs `bacteria_with_decoys_csvConversion.py` to combine cutadapt, minimap2, coverage, and featureCounts outputs into `BACTERIA_<project-directory>.csv`.
+8. Runs `bacteria_with_decoys_csvConversion.py` to combine cutadapt, length-partition, BBSplit, coverage, and featureCounts outputs into `BACTERIA_<project-directory>.csv`.
 9. Writes `BACTERIA_<project-directory>_read_breakdown.csv`, with one sample per row and read counts, percentages of total reads, and the source of every value.
 
 The summary conversion scripts use only the Python standard library. Positional profiling uses pysam and matplotlib.
 
 ## Dependencies
 
-The pipeline environment pins these command-line tools:
+The pipeline environment includes these tools:
 
 - Python 3.13.15
 - cutadapt 5.2 (NEB mode uses its rightmost 3' adapter matching)
-- minimap2 2.30
+- BBMap 39.79 (provides BBSplit / `bbsplit.sh`)
 - samtools 1.24
 - Subread / featureCounts 2.1.1
 - pysam
 - matplotlib
 
 A conda environment file is provided in `environment.yml`.
+The shell pipeline also requires `sha256sum` (GNU coreutils) to identify reference files for its index cache.
 
 ## Create the conda environment
 
@@ -53,10 +54,10 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
 | `SAMPLE_SIZE` | Maximum reads sampled from each FASTQ (default: `5000`). |
 | `SAMPLE_SEED` | Seed used to make random sampling reproducible. |
-| `DECOY_MINIMAP2_REFERENCE` | Minimap2 reference basename for the decoy/pangenome reference. |
-| `BACTERIA_MINIMAP2_REFERENCE` | Shared basename for the bacterial minimap2 index (or FASTA) and GFF annotation. |
-| `HOST_MINIMAP2_REFERENCE` | Optional shared basename for the host index (or FASTA) and GFF annotation; leave empty to disable host mapping and counting. |
-| `MINIMAP2_PRESET` | Long-read minimap2 preset: `map-ont` (default), `map-hifi`, or `map-pb`. Other presets are rejected. |
+| `DECOY_BBSPLIT_REFERENCE` | FASTA basename for the decoy/pangenome reference. |
+| `BACTERIA_BBSPLIT_REFERENCE` | Shared basename for the bacterial FASTA and GFF annotation. |
+| `HOST_BBSPLIT_REFERENCE` | Optional shared basename for the host FASTA and GFF annotation; leave empty to disable host mapping and counting. |
+| `BBSPLIT_K` | BBSplit k-mer length: integer `1`–`15` (default: `11`). All stages use fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 qtrim=f interleaved=f`. |
 | `ADAPTER_TRIMMING_MODE` | `legacy` (default) or `neb_e7330` for NEBNext E7330S Illumina libraries sequenced with Nanopore. |
 | `CUTADAPT_ERROR_RATE` | Maximum adapter alignment error rate (default: `0.15`); mismatches and indels are allowed. |
 | `CUTADAPT_MIN_OVERLAP` | Minimum adapter overlap, in nucleotides (default: `12`). |
@@ -70,7 +71,7 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `TRIM_ILLUMINA_ADAPTERS` | Legacy mode only: optional second Cutadapt pass for standard Illumina and small-RNA kit adapters; unmatched reads are retained. |
 | `ADAPTER_ILLUMINA` | Standard Illumina 3' adapter used by the optional second trimming pass. |
 | `ADAPTER_ILLUMINA_SMALL_RNA` | Illumina small-RNA kit 3' adapter used by the optional second trimming pass. |
-| `MIN_READ_LENGTH` | Minimum retained length **after all trimming** (default: `20`). Existing project configs with explicit values such as `22` keep that value. |
+| `MIN_READ_LENGTH` | Minimum retained length **after all trimming**, from `1` through `6000` (default: `20`). Existing project configs with explicit values such as `22` keep that value. The alignment maximum is fixed at `6000` bp. |
 | `THREADS` | Number of threads used by every multithreaded step (default: `16`). |
 | `GENE_POSITION_BINS` | Number of equal normalized 5'-to-3' bins (default: `100`). |
 | `METAGENE_MIN_FEATURE_READS` | Assigned reads required for a feature to contribute to aggregate profiles (default: `10`). |
@@ -80,7 +81,11 @@ Edit `config.env` before running the pipeline. The key settings are:
 
 Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before trimming or mapping, the pipeline uses reservoir sampling to select up to `SAMPLE_SIZE` complete long-read records from each input. Files with 5,000 reads or fewer are used in full with the default setting. The temporary sampled inputs are written under `OUTPUT_DIR/.bacteria_sampled_fastq`; original FASTQ files are never modified. Sampling is reproducible for the same input paths and `SAMPLE_SEED`. Set `SAMPLE_READS="false"` for a full analysis.
 
-The minimap2 reference settings are basenames, not individual `.mmi` files. For example, configure `/refs/bacteria_reference`; the pipeline reuses `/refs/bacteria_reference.mmi`, or builds it from `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
+The BBSplit reference settings are FASTA basenames. For example, configure `/refs/bacteria_reference` and supply `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). BBSplit indexes are cached under `OUTPUT_DIR/bbsplit_alignments/indexes/<stage>/k<BBSPLIT_K>/<reference-file-SHA256>`, where `<stage>` is `decoy`, `bacteria`, or `host`. The reference-file checksum and k-mer length separate indexes when a reference or `BBSPLIT_K` changes. Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
+
+When updating an existing run configuration, use `DECOY_BBSPLIT_REFERENCE`, `BACTERIA_BBSPLIT_REFERENCE`, and optional `HOST_BBSPLIT_REFERENCE`, remove the previous alignment preset setting, and supply each reference FASTA. Add `BBSPLIT_K="11"` or your chosen valid k-mer length. Recreate or update the conda environment from `environment.yml` to install BBMap.
+
+The 6000-bp partition is applied after all adapter trimming and the minimum-length filter, so a read originally over 6000 bp can still be aligned if trimming brings it within range. Cutadapt logs and adapter statistics continue to report the minimum-length filter before this partition. The per-sample `*.length_filter.tsv` records the eligible and oversized counts separately; oversized reads are excluded from every alignment stage and from final leftover reads. Samples with no eligible reads still appear in both summary CSVs with zero alignment and coverage counts.
 
 In `legacy` mode, set `TRIM_ILLUMINA_ADAPTERS="true"` for libraries that may also contain Illumina-derived adapters. Cutadapt first removes the configured Nanopore 3' adapter, then searches for the standard Illumina and Illumina small-RNA adapters in up to two rounds. The minimum length is applied after both passes. Adapter choices and unmatched-read retention remain compatible with existing configurations; the new error/overlap defaults are `0.15`/`12` (set `0.1`/`3` to recover the old matching tolerance). The Nanopore and optional Illumina reports are `*_nanopore_adapter_log.txt` and `*_illumina_adapter_log.txt`; `*_cutadapt_log.txt` and `*.cutadapt.json` report the final length-filter pass.
 
@@ -138,8 +143,9 @@ TruSeq small-RNA sequence is excluded by default; enable
 An internal 3'-adapter followed by a 5'-adapter is flagged
 `ambiguous_concatemer=1`. The bounded span is retained unsplit, with its internal
 junction, for review; it still undergoes the final length filter. These reads
-and partial/unbounded reads remain in the FASTQ supplied to the unchanged
-mapping pipeline. Neither flag certifies a clean insert. A biological sequence
+and partial/unbounded reads remain eligible for the mapping pipeline if their
+final lengths are between `MIN_READ_LENGTH` and 6000 bp. Neither flag certifies
+a clean insert. A biological sequence
 identical to a terminal adapter (or to a complete library layout) cannot be
 distinguished from that adapter using sequence matching alone.
 
@@ -181,8 +187,13 @@ either/both sides; P5/P7, index and Nanopore outer flanks; substitutions,
 insertions and deletions; terminal partial adapters; dimers; reads without
 adapters; internal motifs; ambiguous concatemers; round limits; short/long
 inserts; exact qualities/headers; gzip/plain FASTQ; and legacy final filtering.
+Length-partition and CSV regressions also cover the 6000/6001-bp boundary,
+gzip output, eligible/oversized counts, and read-count conservation.
+When the pipeline dependencies are installed, the suite also runs BBSplit
+through feature counting, coverage, and positional profiling with default and
+custom k values, host mapping enabled and disabled, and empty/all-excluded samples.
 
-To enable host mapping and feature counting, set `HOST_MINIMAP2_REFERENCE` to the shared host reference basename and provide its FASTA/index and matching `.gff*` annotation. Setting it to `""` skips host index preparation, alignment, and counting. Host input consists exclusively of reads that did not align to either the decoy or bacterial reference.
+To enable host mapping and feature counting, set `HOST_BBSPLIT_REFERENCE` to the shared host reference basename and provide its FASTA and matching `.gff*` annotation. Setting it to `""` skips host index preparation, alignment, and counting. Host input consists exclusively of eligible reads that did not align to either the decoy or bacterial reference.
 
 ## Run the pipeline
 
@@ -200,23 +211,26 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 
 ## Important outputs
 
-- `*_<MIN_READ_LENGTH>bp.trim.fastq` — adapter-trimmed FASTQ files after the final length filter.
-- `minimap2_alignments/decoy/` — decoy SAM files, minimap2 reports and diagnostic logs, and decoy-unmapped reads.
-- `minimap2_alignments/bacteria/` — bacterial SAM/BAM files, minimap2 logs, and coverage reports.
-- `minimap2_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.
-- `minimap2_alignments/host/` — optional host SAM files, minimap2 logs, and host featureCounts results.
-- `minimap2_alignments/leftover_reads/*_leftover.fastq.gz` — final reads that mapped to none of the configured decoy, bacterial, or host references. These files are always created; when host mapping is disabled, they contain the bacterial-unmapped reads.
+- `*_<MIN_READ_LENGTH>bp.trim.fastq` — adapter-trimmed FASTQ files with final lengths from `MIN_READ_LENGTH` through 6000 bp inclusive, used as the alignment input.
+- `*_<MIN_READ_LENGTH>bp.length_filter.tsv` — post-trimming partition counts: `input`, `eligible`, `oversized`, and `max_read_length`; input is the number passing the minimum-length filter and the maximum is fixed at `6000`.
+- `bbsplit_alignments/oversized_reads/*_<MIN_READ_LENGTH>bp_over_6000bp.fastq.gz` — reads longer than 6000 bp after all adapter trimming, saved without alignment or other downstream processing.
+- `bbsplit_alignments/decoy/` — decoy SAM files, BBSplit reports and diagnostic logs, and decoy-unmapped reads.
+- `bbsplit_alignments/bacteria/` — bacterial SAM/BAM files, BBSplit reports and diagnostic logs, and coverage reports.
+- `bbsplit_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.
+- `bbsplit_alignments/host/` — optional host SAM files, BBSplit reports and diagnostic logs, and host featureCounts results.
+- `*.bbsplit.txt` and `*.bbsplit.stderr.txt` in each alignment stage — stable TSV `input`/`aligned`/`unmapped` counts and raw BBSplit diagnostic logs, respectively.
+- `bbsplit_alignments/leftover_reads/*_leftover.fastq.gz` — final eligible reads that mapped to none of the configured decoy, bacterial, or host references. These files are always created; when host mapping is disabled, they contain the bacterial-unmapped reads. Oversized reads are excluded.
 - `featurecounts_BACTERIA_summary.txt` and `featurecounts_BACTERIA_summary.csv` — featureCounts results.
-- `minimap2_alignments/host/featurecounts_HOST_summary.txt` and `.csv` — optional, separate host featureCounts results.
-- `minimap2_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools coverage reports.
-- `minimap2_alignments/bacteria/BACTERIA_*.feature_read_positions.csv` — unique per-read positions and explicitly flagged ambiguous overlaps.
-- `minimap2_alignments/bacteria/BACTERIA_*.feature_position_bins.csv` — read counts and within-feature fractions for every feature and normalized bin.
-- `minimap2_alignments/bacteria/BACTERIA_*.metagene_{CDS,non_CDS}_profile.csv` and `.png` — separate protein-coding and noncoding aggregate profiles.
-- `minimap2_alignments/bacteria/BACTERIA_*.metagene_non_CDS_by_type.csv` and `.png` — subtype profiles (for example rRNA, tRNA, ncRNA, tmRNA, and other).
-- `minimap2_alignments/bacteria/BACTERIA_*.metagene_CDS_vs_non_CDS.png` — comparison of mean normalized profiles.
-- `minimap2_alignments/bacteria/BACTERIA_*.feature_position_summary.csv` — examined, unique, ambiguous, outside-feature, contributing-feature, and non-CDS subtype counts.
-- `BACTERIA_<project-directory>.csv` — combined summary table.
-- `BACTERIA_<project-directory>_read_breakdown.csv` — per-sample read disposition. Each attribute has a raw count, a percentage of total input reads, and a source column. Bacterial and host non-rRNA values are the corresponding aligned counts minus reads assigned to an `rRNA` feature. Leftover reads passed cutadapt but aligned to none of the decoy, bacterial, or host references.
+- `bbsplit_alignments/host/featurecounts_HOST_summary.txt` and `.csv` — optional, separate host featureCounts results.
+- `bbsplit_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools coverage reports.
+- `bbsplit_alignments/bacteria/BACTERIA_*.feature_read_positions.csv` — unique per-read positions and explicitly flagged ambiguous overlaps.
+- `bbsplit_alignments/bacteria/BACTERIA_*.feature_position_bins.csv` — read counts and within-feature fractions for every feature and normalized bin.
+- `bbsplit_alignments/bacteria/BACTERIA_*.metagene_{CDS,non_CDS}_profile.csv` and `.png` — separate protein-coding and noncoding aggregate profiles.
+- `bbsplit_alignments/bacteria/BACTERIA_*.metagene_non_CDS_by_type.csv` and `.png` — subtype profiles (for example rRNA, tRNA, ncRNA, tmRNA, and other).
+- `bbsplit_alignments/bacteria/BACTERIA_*.metagene_CDS_vs_non_CDS.png` — comparison of mean normalized profiles.
+- `bbsplit_alignments/bacteria/BACTERIA_*.feature_position_summary.csv` — examined, unique, ambiguous, outside-feature, contributing-feature, and non-CDS subtype counts.
+- `BACTERIA_<project-directory>.csv` — combined summary table, including eligible reads and reads excluded for exceeding 6000 bp after trimming.
+- `BACTERIA_<project-directory>_read_breakdown.csv` — per-sample read disposition, including eligible and oversized counts. Each attribute has a raw count, a percentage of total input reads, and a source column. Bacterial and host non-rRNA values are the corresponding aligned counts minus reads assigned to an `rRNA` feature. Leftover reads passed the minimum- and maximum-length filters but aligned to none of the decoy, bacterial, or host references.
 
 ## Notes
 

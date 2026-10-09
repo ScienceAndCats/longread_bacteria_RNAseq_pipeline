@@ -17,10 +17,10 @@ source "$CONFIG_FILE"
 : "${SAMPLE_READS:=false}"
 : "${SAMPLE_SIZE:=5000}"
 : "${SAMPLE_SEED:=1}"
-: "${DECOY_MINIMAP2_REFERENCE:?Set DECOY_MINIMAP2_REFERENCE in $CONFIG_FILE}"
-: "${BACTERIA_MINIMAP2_REFERENCE:?Set BACTERIA_MINIMAP2_REFERENCE in $CONFIG_FILE}"
-: "${HOST_MINIMAP2_REFERENCE:=}"
-: "${MINIMAP2_PRESET:=map-ont}"
+: "${DECOY_BBSPLIT_REFERENCE:?Set DECOY_BBSPLIT_REFERENCE in $CONFIG_FILE}"
+: "${BACTERIA_BBSPLIT_REFERENCE:?Set BACTERIA_BBSPLIT_REFERENCE in $CONFIG_FILE}"
+: "${HOST_BBSPLIT_REFERENCE:=}"
+: "${BBSPLIT_K:=11}"
 : "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
 : "${TRIM_ILLUMINA_ADAPTERS:=false}"
 : "${ADAPTER_ILLUMINA:=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA}"
@@ -34,10 +34,10 @@ source "$CONFIG_FILE"
 [[ "$THREADS" =~ ^[1-9][0-9]*$ ]] || { echo "THREADS must be a positive integer" >&2; exit 1; }
 [[ "$GENE_POSITION_BINS" =~ ^[1-9][0-9]*$ ]] || { echo "GENE_POSITION_BINS must be a positive integer" >&2; exit 1; }
 [[ "$METAGENE_MIN_FEATURE_READS" =~ ^[1-9][0-9]*$ ]] || { echo "METAGENE_MIN_FEATURE_READS must be a positive integer" >&2; exit 1; }
-case "$MINIMAP2_PRESET" in
-  map-ont|map-hifi|map-pb) ;;
-  *) echo "MINIMAP2_PRESET must be a long-read preset: map-ont, map-hifi, or map-pb" >&2; exit 1 ;;
-esac
+[[ "$BBSPLIT_K" =~ ^([1-9]|1[0-5])$ ]] || { echo "BBSPLIT_K must be an integer from 1 to 15" >&2; exit 1; }
+[[ "$MIN_READ_LENGTH" =~ ^[1-9][0-9]*$ ]] && (( MIN_READ_LENGTH <= 6000 )) || {
+  echo "MIN_READ_LENGTH must be a positive integer no greater than 6000" >&2; exit 1;
+}
 case "${TRIM_ILLUMINA_ADAPTERS,,}" in
   true|false) ;;
   *) echo "TRIM_ILLUMINA_ADAPTERS must be true or false" >&2; exit 1 ;;
@@ -92,28 +92,29 @@ find_gene_identifier_attribute() {
   '
 }
 
-BACTERIA_GFF=$(find_gff_annotation "$BACTERIA_MINIMAP2_REFERENCE" "bacterial")
+BACTERIA_GFF=$(find_gff_annotation "$BACTERIA_BBSPLIT_REFERENCE" "bacterial")
 if ! BACTERIA_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$BACTERIA_GFF"); then
   echo "ERROR: bacterial annotation has none of the locus, locus_tag, or gene attributes: $BACTERIA_GFF" >&2
   exit 1
 fi
 HOST_GFF=""
 HOST_GENE_ATTRIBUTE=""
-if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
-  HOST_GFF=$(find_gff_annotation "$HOST_MINIMAP2_REFERENCE" "host")
+if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
+  HOST_GFF=$(find_gff_annotation "$HOST_BBSPLIT_REFERENCE" "host")
   if ! HOST_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$HOST_GFF"); then
     echo "ERROR: host annotation has none of the locus, locus_tag, or gene attributes: $HOST_GFF" >&2
     exit 1
   fi
 fi
 
-ALIGNMENT_DIR="$OUTPUT_DIR/minimap2_alignments"
+ALIGNMENT_DIR="$OUTPUT_DIR/bbsplit_alignments"
 DECOY_ALIGNMENT_DIR="$ALIGNMENT_DIR/decoy"
 BACTERIA_ALIGNMENT_DIR="$ALIGNMENT_DIR/bacteria"
 HOST_ALIGNMENT_DIR="$ALIGNMENT_DIR/host"
 LEFTOVER_READS_DIR="$ALIGNMENT_DIR/leftover_reads"
-mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR" "$LEFTOVER_READS_DIR"
-if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
+OVERSIZED_READS_DIR="$ALIGNMENT_DIR/oversized_reads"
+mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR" "$LEFTOVER_READS_DIR" "$OVERSIZED_READS_DIR"
+if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
   mkdir -p "$HOST_ALIGNMENT_DIR"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,40 +122,60 @@ if [[ "$CSV_CONVERSION_SCRIPT" != /* ]]; then
   CSV_CONVERSION_SCRIPT="$SCRIPT_DIR/$CSV_CONVERSION_SCRIPT"
 fi
 
-# Reuse a minimap2 index or build one from a FASTA beside the configured
-# basename. The basename convention also keeps annotation discovery unchanged.
-prepare_minimap2_index() {
-  local index_basename="$1"
+# Reference basenames keep annotation discovery unchanged. BBSplit requires
+# FASTA references and stores its own indexes beneath the output directory.
+find_reference_fasta() {
+  local reference_basename="$1"
   local reference_label="$2"
-  local threads="$3"
-  local fasta_extension fasta_file
-  if [[ -f "${index_basename}.mmi" ]]; then
-    echo "using existing $reference_label minimap2 index: ${index_basename}.mmi"
-    return 0
-  fi
-
-  fasta_file=""
+  local fasta_extension
   for fasta_extension in fa fasta fna fa.gz fasta.gz fna.gz; do
-    if [[ -f "${index_basename}.${fasta_extension}" ]]; then
-      fasta_file="${index_basename}.${fasta_extension}"
-      break
+    if [[ -f "${reference_basename}.${fasta_extension}" ]]; then
+      printf '%s\n' "${reference_basename}.${fasta_extension}"
+      return 0
     fi
   done
-
-  if [[ -z "$fasta_file" ]]; then
-    echo "ERROR: No reference FASTA found; expected ${index_basename}.{fa,fasta,fna}[.gz]." >&2
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$index_basename")"
-  echo "building $reference_label minimap2 index from $fasta_file ..."
-  minimap2 -t "$threads" -d "${index_basename}.mmi" "$fasta_file"
+  echo "ERROR: No $reference_label reference FASTA found; expected ${reference_basename}.{fa,fasta,fna}[.gz]." >&2
+  return 1
 }
 
-prepare_minimap2_index "$DECOY_MINIMAP2_REFERENCE" "decoy" "$THREADS"
-prepare_minimap2_index "$BACTERIA_MINIMAP2_REFERENCE" "bacterial" "$THREADS"
-if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
-  prepare_minimap2_index "$HOST_MINIMAP2_REFERENCE" "host" "$THREADS"
+# Each stage, k value, and reference content uses an isolated index. BBSplit's
+# own reference-name cache would otherwise reuse stale sequence after an edit.
+run_bbsplit() {
+  # BBTools' launcher reconstructs its Java command with eval, so retain Bash
+  # quoting for paths containing spaces or shell metacharacters.
+  local argument escaped
+  local quoted_arguments=()
+  for argument in "$@"; do
+    printf -v escaped '%q' "$argument"
+    quoted_arguments+=("$escaped")
+  done
+  bbsplit.sh "${quoted_arguments[@]}"
+}
+
+prepare_bbsplit_index() {
+  local reference_basename="$1" stage="$2"
+  local fasta_file fingerprint index_dir
+  fasta_file=$(find_reference_fasta "$reference_basename" "$stage") || return 1
+  fingerprint=$(sha256sum "$fasta_file") || return 1
+  fingerprint=${fingerprint%% *}
+  index_dir="$ALIGNMENT_DIR/indexes/$stage/k$BBSPLIT_K/$fingerprint"
+  mkdir -p "$index_dir" || return 1
+  echo "preparing $stage BBSplit index from $fasta_file ..." >&2
+  # Explicit set names keep FASTA filenames out of SAM sequence identifiers.
+  if ! run_bbsplit "ref_${stage}=$fasta_file" "path=$index_dir" build=1 "k=$BBSPLIT_K" \
+    "threads=$THREADS" mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 \
+    qtrim=f interleaved=f secondary=f ambiguous=best trimrefdescription=t \
+    > "$index_dir/index.stdout.txt" 2> "$index_dir/index.stderr.txt"; then
+    cat "$index_dir/index.stderr.txt" >&2
+    return 1
+  fi
+  printf '%s\n' "$index_dir"
+}
+
+DECOY_BBSPLIT_INDEX=$(prepare_bbsplit_index "$DECOY_BBSPLIT_REFERENCE" "decoy")
+BACTERIA_BBSPLIT_INDEX=$(prepare_bbsplit_index "$BACTERIA_BBSPLIT_REFERENCE" "bacteria")
+if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
+  HOST_BBSPLIT_INDEX=$(prepare_bbsplit_index "$HOST_BBSPLIT_REFERENCE" "host")
 fi
 
 matched_fastqs=("$FASTQ_DIR"/$FASTQ_GLOB)
@@ -223,13 +244,19 @@ case "${SAMPLE_READS,,}" in
   *) echo "SAMPLE_READS must be true or false" >&2; exit 1 ;;
 esac
 
-# Complete adapter trimming before applying the configured minimum length.
+# Complete all adapter trimming and the minimum length filter before routing
+# reads above 6000 bp out of the alignment/analysis pipeline.
 trimmed_fastqs=(); sample_names=()
 for input_fastq in "${fastq_files[@]}"; do
   filename=$(basename "$input_fastq"); filename=${filename%.gz}; sample=${filename%.fastq}
   trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.trim.fastq"
-  bash "$SCRIPT_DIR/trim_fastq.sh" "$CONFIG_FILE" "$input_fastq" "$trimmed_fastq" \
+  all_trimmed_fastq="$OUTPUT_DIR/.${sample}_${MIN_READ_LENGTH}bp.adapter_trimmed.fastq"
+  bash "$SCRIPT_DIR/trim_fastq.sh" "$CONFIG_FILE" "$input_fastq" "$all_trimmed_fastq" \
     "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp"
+  python3 "$SCRIPT_DIR/split_trimmed_fastq.py" "$all_trimmed_fastq" "$trimmed_fastq" \
+    "$OVERSIZED_READS_DIR/${sample}_${MIN_READ_LENGTH}bp_over_6000bp.fastq.gz" \
+    "$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.length_filter.tsv"
+  rm -- "$all_trimmed_fastq"
   trimmed_fastqs+=("$trimmed_fastq"); sample_names+=("$sample")
 done
 
@@ -239,18 +266,26 @@ fastq_read_count() {
     awk 'END { if (NR % 4) exit 1; print NR / 4 }'
 }
 
-# Align reads with the nanopore-aware minimap2 preset, retain only primary
+# Align reads with BBSplit's long-read mapper, retain only primary
 # alignments in SAM, and write unmapped reads for the next classification stage.
 # The small TSV report is intentionally stable input for both CSV generators.
-minimap2_stage() {
-  local reference="$1" sam="$2" report="$3" unmapped="$4" input="$5"
-  local input_count unmapped_count aligned_count raw_log="${report%.txt}.minimap2.stderr.txt"
+bbsplit_stage() {
+  local index_dir="$1" sam="$2" report="$3" unmapped="$4" input="$5"
+  local input_count unmapped_count aligned_count primary_count raw_log="${report%.txt}.stderr.txt"
   input_count=$(fastq_read_count "$input")
-  minimap2 -t "$THREADS" -ax "$MINIMAP2_PRESET" --secondary=no "${reference}.mmi" "$input" \
+  run_bbsplit "path=$index_dir" build=1 "in=$input" out=stdout.sam overwrite=t \
+    "threads=$THREADS" "k=$BBSPLIT_K" mapmode=pb \
+    msa=MultiStateAligner9PacBio fastareadlen=6000 \
+    qtrim=f interleaved=f secondary=f ambiguous=best trimrefdescription=t \
     2> "$raw_log" | samtools view -h -F 2304 -o "$sam" -
   samtools fastq -@ "$THREADS" -f 4 -0 "$unmapped" -s /dev/null -n "$sam" 2>> "$raw_log"
   unmapped_count=$(fastq_read_count "$unmapped")
-  aligned_count=$((input_count - unmapped_count))
+  primary_count=$(samtools view -c "$sam")
+  aligned_count=$(samtools view -c -F 4 "$sam")
+  if (( primary_count != input_count || aligned_count + unmapped_count != input_count )); then
+    echo "ERROR: BBSplit read counts do not balance for $input; see $raw_log" >&2
+    return 1
+  fi
   printf 'metric\tcount\ninput\t%s\naligned\t%s\nunmapped\t%s\n' \
     "$input_count" "$aligned_count" "$unmapped_count" > "$report"
 }
@@ -259,11 +294,11 @@ minimap2_stage() {
 decoy_unmapped_fastqs=()
 for idx in "${!trimmed_fastqs[@]}"; do
   i="${trimmed_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-  echo "mapping to bacterial decoys with minimap2: $i_basename ..."
+  echo "mapping to bacterial decoys with BBSplit: $i_basename ..."
   unmapped="$DECOY_ALIGNMENT_DIR/${i_basename}_unmapped_to_other_bugs.fastq.gz"
-  minimap2_stage "$DECOY_MINIMAP2_REFERENCE" \
+  bbsplit_stage "$DECOY_BBSPLIT_INDEX" \
     "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.sam" \
-    "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.minimap2.txt" \
+    "$DECOY_ALIGNMENT_DIR/${i_basename}.mapped_to_other_bugs.bbsplit.txt" \
     "$unmapped" "$i"
   decoy_unmapped_fastqs+=("$unmapped")
 done
@@ -272,11 +307,11 @@ done
 host_input_fastqs=()
 for idx in "${!decoy_unmapped_fastqs[@]}"; do
   i="${decoy_unmapped_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-  echo "mapping to the bacterial reference with minimap2: $i_basename ..."
+  echo "mapping to the bacterial reference with BBSplit: $i_basename ..."
   host_input="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria.fastq.gz"
-  minimap2_stage "$BACTERIA_MINIMAP2_REFERENCE" \
+  bbsplit_stage "$BACTERIA_BBSPLIT_INDEX" \
     "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" \
-    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.minimap2.txt" \
+    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.bbsplit.txt" \
     "$host_input" "$i"
   host_input_fastqs+=("$host_input")
 done
@@ -286,13 +321,13 @@ BACTERIA_sam_filenames=("$BACTERIA_ALIGNMENT_DIR"/BACTERIA*.sam)
 # Save the reads left after all configured classification stages under one
 # stable name. With no host reference, the bacterial-unmapped reads are already
 # the final leftovers; otherwise, write the host-unmapped reads there directly.
-if [[ -n "$HOST_MINIMAP2_REFERENCE" ]]; then
+if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
   for idx in "${!host_input_fastqs[@]}"; do
     i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-    echo "mapping to the host reference with minimap2: $i_basename ..."
-    minimap2_stage "$HOST_MINIMAP2_REFERENCE" \
+    echo "mapping to the host reference with BBSplit: $i_basename ..."
+    bbsplit_stage "$HOST_BBSPLIT_INDEX" \
       "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
-      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.minimap2.txt" \
+      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.bbsplit.txt" \
       "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz" "$i"
   done
 else
@@ -315,7 +350,7 @@ featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -s 1 -g "$BACTERIA_GENE_ATTRIBUTE
   -o "$OUTPUT_DIR/featurecounts_BACTERIA_rRNA.txt" "${BACTERIA_sam_filenames[@]}"
 
 # When a host reference is configured, independently assign host alignments to
-# its CDS features and keep the results alongside the host minimap2 outputs.
+# its CDS features and keep the results alongside the host BBSplit outputs.
 if [[ -n "$HOST_GFF" ]]; then
   HOST_sam_filenames=("$HOST_ALIGNMENT_DIR"/HOST_*.sam)
   featureCounts -T "$THREADS" -a "$HOST_GFF" -O -s 1 -g "$HOST_GENE_ATTRIBUTE" -t CDS \

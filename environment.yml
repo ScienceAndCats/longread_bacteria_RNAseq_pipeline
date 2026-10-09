@@ -6,7 +6,7 @@ channels:
 dependencies:
   - python=3.13.15
   - cutadapt=5.2
-  - minimap2=2.30
+  - bbmap=39.79 # provides BBSplit (bbsplit.sh)
   - samtools=1.24
   - subread=2.1.1 # provides featureCounts
   - pysam
