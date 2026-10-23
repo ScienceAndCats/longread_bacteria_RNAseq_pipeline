@@ -1,13 +1,13 @@
 # Whiteley Bacteria Mapping Pipeline
 
-This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, separates reads over 6000 bp after trimming, uses BBSplit to remove reads that map to a decoy/pangenome reference, then maps remaining reads to bacterial and optional host RNA references before genomic DNA references. It discovers references and annotations from folders, counts gene-level alignments, calculates bacterial coverage metrics, and reports the read counts and percentages in CDS, rRNA, other RNA, and intergenic/unannotated regions.
+This repository contains a long-read FASTQ processing pipeline for Oxford Nanopore bacterial sequencing runs. Each FASTQ file is an independent sample, including files whose names contain `_R1`, `_R2`, `_1`, or `_2`. The pipeline trims user-configured adapter sequences, separates reads over 6000 bp after trimming, uses BBSplit to remove reads that map to a decoy/pangenome reference, then maps remaining reads to bacterial and optional host RNA references before genomic DNA references. It discovers references and annotations from folders, counts gene-level alignments, calculates bacterial coverage metrics, and reports the read counts and percentages in CDS, rRNA, other RNA, and intergenic/unannotated regions.
 
 ## What the program does
 
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses Cutadapt to trim adapters in the configured `legacy` or `neb_e7330` mode, then applies the minimum read length. NEB mode extracts both flanks in either orientation and cleans repeated terminal adapters. Reads lacking adapters or having only one confirmed flank are retained if they pass the final length filter. After all trimming, reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
+2. Uses Cutadapt to remove user-configured adapter sequences from both read ends, repeating the process for up to `ADAPTER_MAX_TRIMMING_ROUNDS` rounds (default: `3`). Each round removes at most one adapter from the 5′ end and one from the 3′ end, allowing repeated terminal copies to be exposed and removed in later rounds. The minimum read length is applied after all rounds. Reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
 3. Uses `bbsplit.sh` to map eligible trimmed reads to a decoy/pangenome reference and keeps reads that do **not** map to the decoys.
 4. Maps decoy-unmapped reads in this order: **bacterial RNA → host RNA (if enabled) → bacterial DNA → host DNA (if enabled)**. Only primary-unmapped reads advance to the next stage, so an RNA match takes priority over a later genomic DNA match. RNA stages without reference files are skipped. A final leftover FASTQ contains reads that failed every configured alignment stage. Every stage uses configurable `k` (default `11`) and fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000`, with `qtrim=f` to preserve adapter-trimmed sequences and `interleaved=f` for single-read FASTQ input.
 5. Combines the RNA and DNA alignments for each organism, assigns each mapped read to one exclusive category for the breakdown CSV, and uses `featureCounts` from Subread to count CDS features against the discovered, normalized bacterial and host annotations.
@@ -23,7 +23,7 @@ The summary conversion scripts use only the Python standard library. Reference p
 The pipeline environment includes these tools:
 
 - Python 3.13.15
-- cutadapt 5.2 (NEB mode uses its rightmost 3' adapter matching)
+- cutadapt 5.2
 - BBMap 39.79 (provides BBSplit / `bbsplit.sh`)
 - samtools 1.24
 - Subread / featureCounts 2.1.1
@@ -49,8 +49,11 @@ Edit `config.env` before running the pipeline. The key settings are:
 
 | Setting | Purpose |
 | --- | --- |
-| `FASTQ_DIR` | Directory containing input FASTQ files. |
+| `FASTQ_DIR` | Directory containing input FASTQ files; each file is an independent sample. |
 | `FASTQ_GLOB` | Shell glob for FASTQ inputs, such as `*.fastq`. |
+| `SLURM_MAX_SAMPLES` | Maximum samples accepted per submission (default: `40`); larger input folders produce an error until this limit is increased. |
+| `SLURM_MAX_CONCURRENT` | Maximum sample array tasks running at once (default: `8`). |
+| `SLURM_ACCOUNT` | Optional account override for the Slurm template. |
 | `OUTPUT_DIR` | Directory where output files should be written. |
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
 | `SAMPLE_SIZE` | Maximum reads sampled from each FASTQ (default: `5000`). |
@@ -59,19 +62,11 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `BACTERIA_REFERENCE_DIR` | Folder containing bacterial genomic DNA, CDS/RNA FASTA files, and their annotations, such as `PAO1`. |
 | `HOST_REFERENCE_DIR` | Optional host folder containing DNA and RNA references, including nested folders and RNA shards; leave empty to disable host mapping and counting. |
 | `BBSPLIT_K` | BBSplit k-mer length: integer `1`–`15` (default: `11`). All stages use fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 qtrim=f interleaved=f`. |
-| `ADAPTER_TRIMMING_MODE` | `legacy` (default) or `neb_e7330` for NEBNext E7330S Illumina libraries sequenced with Nanopore. |
+| `ADAPTER_SEQUENCES` | Adapter DNA sequences separated by whitespace, on one or multiple lines. Default: `TTTCTGTTGGTGCTGATATTGC`. Set to `""` to skip adapter matching. |
+| `ADAPTER_REVERSE_COMPLEMENTS` | Also match the reverse complement of each configured adapter (default: `true`); read orientation remains unchanged. |
+| `ADAPTER_MAX_TRIMMING_ROUNDS` | Maximum rounds of trimming at both ends (default: `3`); each round removes at most one adapter per end. |
 | `CUTADAPT_ERROR_RATE` | Maximum adapter alignment error rate (default: `0.15`); mismatches and indels are allowed. |
 | `CUTADAPT_MIN_OVERLAP` | Minimum adapter overlap, in nucleotides (default: `12`). |
-| `ADAPTER_MAX_TRIMMING_ROUNDS` | NEB mode round limit (default: `10`), including initial flank extraction. |
-| `ADAPTER_NEB_5P`, `ADAPTER_NEB_3P` | NEB E7330S 5' and 3' flanks in the insert's forward orientation. |
-| `TRIM_NANOPORE_ADAPTERS` | Enable Nanopore adapter removal (default: `true`); NEB mode limits it to terminal matches on incompletely bounded reads. |
-| `ADAPTER_NANOPORE` | Long-read adapter passed to cutadapt; defaults to the Oxford Nanopore ligation adapter and may be changed for another library preparation. |
-| `ADAPTER_NANOPORE_RC` | Its reverse complement; leave empty to compute it in NEB mode when customizing the adapter. |
-| `TRIM_TRUSEQ_SMALL_RNA` | NEB mode opt-in for terminal TruSeq small-RNA adapter removal (default: `false`). |
-| `ADAPTER_TRUSEQ_SMALL_RNA` | Optional other-kit adapter `TGGAATTCTCGGGTGCCAAGG`. |
-| `TRIM_ILLUMINA_ADAPTERS` | Legacy mode only: optional second Cutadapt pass for standard Illumina and small-RNA kit adapters; unmatched reads are retained. |
-| `ADAPTER_ILLUMINA` | Standard Illumina 3' adapter used by the optional second trimming pass. |
-| `ADAPTER_ILLUMINA_SMALL_RNA` | Illumina small-RNA kit 3' adapter used by the optional second trimming pass. |
 | `MIN_READ_LENGTH` | Minimum retained length **after all trimming**, from `1` through `6000` (default: `20`). Existing project configs with explicit values such as `22` keep that value. The alignment maximum is fixed at `6000` bp. |
 | `THREADS` | Number of threads used by every multithreaded step (default: `16`). |
 | `GENE_POSITION_BINS` | Number of equal normalized 5'-to-3' bins (default: `100`). |
@@ -105,90 +100,39 @@ BBSplit indexes are cached under `OUTPUT_DIR/bbsplit_alignments/indexes/<stage>/
 
 Existing configurations using `DECOY_BBSPLIT_REFERENCE`, `BACTERIA_BBSPLIT_REFERENCE`, and optional `HOST_BBSPLIT_REFERENCE` basenames remain supported as a fallback. New configurations should use the folder settings above. A legacy basename with only a genomic FASTA and GFF runs without an RNA stage.
 
-The 6000-bp partition is applied after all adapter trimming and the minimum-length filter, so a read originally over 6000 bp can still be aligned if trimming brings it within range. Cutadapt logs and adapter statistics continue to report the minimum-length filter before this partition. The per-sample `*.length_filter.tsv` records the eligible and oversized counts separately; oversized reads are excluded from every alignment stage and from final leftover reads. Samples with no eligible reads still appear in both summary CSVs with zero alignment and coverage counts.
+The 6000-bp partition is applied after all adapter trimming and the minimum-length filter, so a read originally over 6000 bp can still be aligned if trimming brings it within range. The final Cutadapt log and JSON report the minimum-length filter before this partition. The per-sample `*.length_filter.tsv` records the eligible and oversized counts separately; oversized reads are excluded from every alignment stage and from final leftover reads. Samples with no eligible reads still appear in both summary CSVs with zero alignment and coverage counts.
 
-In `legacy` mode, set `TRIM_ILLUMINA_ADAPTERS="true"` for libraries that may also contain Illumina-derived adapters. Cutadapt first removes the configured Nanopore 3' adapter, then searches for the standard Illumina and Illumina small-RNA adapters in up to two rounds. The minimum length is applied after both passes. Adapter choices and unmatched-read retention remain compatible with existing configurations; the new error/overlap defaults are `0.15`/`12` (set `0.1`/`3` to recover the old matching tolerance). The Nanopore and optional Illumina reports are `*_nanopore_adapter_log.txt` and `*_illumina_adapter_log.txt`; `*_cutadapt_log.txt` and `*.cutadapt.json` report the final length-filter pass.
+### Adapter trimming
 
-### NEBNext E7330S libraries sequenced using Nanopore
-
-For NEBNext Small RNA Library Prep Set for Illumina (E7330S) libraries, including Plasmidsaurus Premium PCR sequencing, configure:
+List the adapter sequences present in your Nanopore library. Each sequence is searched at both exposed read ends; an internal adapter-like motif is retained. For example:
 
 ```bash
-ADAPTER_TRIMMING_MODE="neb_e7330"
-ADAPTER_NEB_5P="GTTCAGAGTTCTACAGTCCGACGATC"
-ADAPTER_NEB_3P="AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+ADAPTER_SEQUENCES="TTTCTGTTGGTGCTGATATTGC"
+ADAPTER_REVERSE_COMPLEMENTS="true"
+ADAPTER_MAX_TRIMMING_ROUNDS="3"
 CUTADAPT_ERROR_RATE="0.15"
 CUTADAPT_MIN_OVERLAP="12"
-ADAPTER_MAX_TRIMMING_ROUNDS="10"
-MIN_READ_LENGTH="20"  # use 22 if required by your analysis
-TRIM_NANOPORE_ADAPTERS="true"
-TRIM_TRUSEQ_SMALL_RNA="false"
+MIN_READ_LENGTH="20"
 ```
 
-`trim_neb_adapters.py` streams FASTQ through Cutadapt's existing adapter parser,
-`AdapterCutter`, and `ReverseComplementer`, which implement `-g`/`-a`, `--times`,
-and `--revcomp`. It needs no dependencies beyond those installed with Cutadapt.
-Matching is performed in one process; `THREADS` still controls the legacy
-Cutadapt commands and downstream multithreaded tools.
+For multiple adapters, put the DNA sequences in the same whitespace-separated string; line breaks are allowed:
 
-1. Find a linked `-g '5P...3P;rightmost'` match requiring both flanks, testing
-   the read and its reverse complement with Cutadapt's `--revcomp` engine.
-   Keep the span between the leftmost best 5' match and rightmost best 3' match.
-   This single linked extraction removes both outer flanks, including any
-   preceding/following PCR primer, index, P5/P7 or Nanopore sequence. Read
-   orientation is normalized to the supplied forward NEB adapters.
-2. Clean exposed ends using non-internal `-g X5P` and `-a 3PX` matching with
-   `--times 2` per cleanup round. The literal `X` disallows internal matches
-   while allowing partial adapters at the read ends. Consecutive 5' and/or 3'
-   copies are removed until no terminal matches remain or the total round
-   budget is reached. This avoids a broad repeated search through the insert.
-3. Without a linked match, retain reads and try terminal NEB matches, using
-   `--revcomp` until a NEB flank establishes orientation. Optional terminal
-   Nanopore cleanup recognizes both `ADAPTER_NANOPORE` and its reverse
-   complement at either end; these matches never determine insert orientation.
-   Complete NEB constructs receive no additional Nanopore pass, protecting
-   Nanopore-like motifs within the bounded insert.
-4. Apply `MIN_READ_LENGTH` only after these operations. IDs and header comments
-   are unchanged; qualities are sliced with their bases and reversed when a
-   read is reverse-complemented. Plain and gzipped FASTQ input are supported.
+```bash
+ADAPTER_SEQUENCES="TTTCTGTTGGTGCTGATATTGC
+ACGTTGCAACGTTGCA"
+```
 
-A single confirmed flank is labeled `5p_only` or `3p_only`, **not** a fully
-bounded biological insert. If the only NEB motif is internal and its outer
-sequence cannot be bounded, the read is left intact and its remaining motif
-is reported. Terminal cleanup does not guess which unknown bases are adapters.
-TruSeq small-RNA sequence is excluded by default; enable
-`TRIM_TRUSEQ_SMALL_RNA` explicitly for terminal matching from that kit.
-`TRIM_ILLUMINA_ADAPTERS` applies only to legacy mode.
+The second sequence above is illustrative; replace it with an adapter used in your library. With `ADAPTER_REVERSE_COMPLEMENTS="true"`, the pipeline adds each sequence's reverse complement to the matching list automatically. It does not reverse-complement or reorient reads. Headers and base qualities remain associated with the original read, with trimmed bases and their qualities removed together.
 
-An internal 3'-adapter followed by a 5'-adapter is flagged
-`ambiguous_concatemer=1`. The bounded span is retained unsplit, with its internal
-junction, for review; it still undergoes the final length filter. These reads
-and partial/unbounded reads remain eligible for the mapping pipeline if their
-final lengths are between `MIN_READ_LENGTH` and 6000 bp. Neither flag certifies
-a clean insert. A biological sequence
-identical to a terminal adapter (or to a complete library layout) cannot be
-distinguished from that adapter using sequence matching alone.
+In each round, Cutadapt first trims at most one 5′ adapter, then at most one 3′ adapter. A second or third round can remove another adapter copy exposed by the preceding round. `ADAPTER_MAX_TRIMMING_ROUNDS="3"` therefore permits up to three adapter removals per end. Increase the limit if the library contains more repeated terminal copies. The minimum-length filter runs only after all rounds, followed by the fixed 6000-bp alignment limit. Reads with no adapter match are retained if they pass the length filters. Setting `ADAPTER_SEQUENCES=""` skips matching and still applies those filters.
 
-NEB mode writes these files per sample, using the same `<sample>_<length>bp` prefix:
+Each sample uses the `<sample>_<length>bp` output prefix:
 
 | File | Contents |
 | --- | --- |
-| `*.cutadapt_log.txt` | Cutadapt version/settings and whole-operation counts, including final length filtering; compatible with existing summary readers. |
-| `*.adapter_stats.csv` | One row: total/detected/trimmed reads, both/single flanks, reverse complements, repeated adapters, multiple rounds, length discards, remaining motifs, round-limit hits, ambiguous concatemers, retained count and retained length minimum/maximum/mean. |
-| `*.adapter_reads.csv` | Per-read evidence and retention flags, including original header, lengths, flank match counts and ambiguity flags; read numbers disambiguate duplicate IDs. |
-| `*.read_lengths.csv` | Exact retained-read length distribution (`length,retained_reads`). |
-
-The NEB reports are generated from observed per-read Cutadapt match objects
-and final lengths, rather than estimates from marginal per-adapter totals.
-Both-flank counts require accepted matches to each NEB flank. Repeated-adapter
-counts require multiple accepted matches to the same adapter type; the initial
-linked extraction counts as one round removing two flanks, and each cleanup
-round removes up to two adapters. Counts include reads subsequently discarded
-by length, except fields explicitly labeled retained. `reads_with_adapters_detected`
-also includes diagnostic interior motif matches; `trimmed_reads` counts actual
-length changes. Remaining-motif counts include internal biological lookalikes
-and do not by themselves prove adapter contamination. A separate terminal
-remaining count identifies incomplete cleanup at the round limit.
+| `*.adapter_roundN.5p.log` | Native Cutadapt report for the 5′ pass of round `N`. |
+| `*.adapter_roundN.3p.log` | Native Cutadapt report for the 3′ pass of round `N`. |
+| `*.cutadapt_log.txt` and `*.cutadapt.json` | Native Cutadapt reports for the final minimum-length filter. Adapter matches are recorded in the round logs, not accumulated in these final filter reports. |
 
 To trim a FASTQ without any reference mapping, run from the repository:
 
@@ -196,28 +140,19 @@ To trim a FASTQ without any reference mapping, run from the repository:
 bash trim_fastq.sh config.env reads.fastq.gz trimmed.fastq sample_20bp
 ```
 
-Run the synthetic regression suite in the pipeline environment:
+When the optional local `tests/` fixtures are present, run them in the pipeline environment:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-It covers 22-nt inserts in both orientations; two/three repeated copies on
-either/both sides; P5/P7, index and Nanopore outer flanks; substitutions,
-insertions and deletions; terminal partial adapters; dimers; reads without
-adapters; internal motifs; ambiguous concatemers; round limits; short/long
-inserts; exact qualities/headers; gzip/plain FASTQ; and legacy final filtering.
-Length-partition and CSV regressions also cover the 6000/6001-bp boundary,
-gzip output, eligible/oversized counts, and read-count conservation.
-When the pipeline dependencies are installed, the suite also runs BBSplit
-through feature counting, coverage, and positional profiling with default and
-custom k values, host mapping enabled and disabled, and empty/all-excluded samples. Folder-reference regressions also cover RNA shards, GenBank annotations, RNA-before-DNA routing, exclusive region counts, and percentages.
+The local checks cover trimming at both ends, multiple configured adapters, reverse-complement adapter matching without reorienting reads, repeated terminal copies, internal motifs, empty adapter lists, and final length filtering. Length-partition and CSV checks cover the 6000/6001-bp boundary, gzip output, eligible/oversized counts, and read-count conservation. When dependencies are installed, integration checks run BBSplit through feature counting, coverage, and positional profiling with host mapping enabled and disabled, empty samples, reference folders and RNA shards, GenBank annotations, RNA-before-DNA routing, and exclusive region counts and percentages.
 
 To enable host mapping and feature counting, set `HOST_REFERENCE_DIR` to the `human` or `mouse` folder. Setting it to `""` skips host reference preparation, alignment, and counting. Host RNA is searched after bacterial RNA but before bacterial DNA; host DNA is searched last.
 
 ## Run the pipeline
 
-From this repository, run:
+To process the configured FASTQ files sequentially, run:
 
 ```bash
 bash map_bacteria_with_decoys.sh config.env
@@ -228,6 +163,96 @@ You can keep multiple config files and pass the one for the current run:
 ```bash
 bash map_bacteria_with_decoys.sh configs/project_a.env
 ```
+
+### Submit sample jobs on Slurm
+
+The included `run_bacteria_pipeline.sbatch` follows the example Slurm template:
+one node, one task, 16 CPUs, 64 GB RAM, and a four-hour time limit. Fill in its
+`YOUR_ACCOUNT` placeholder, or set `SLURM_ACCOUNT` in the config. Fill in the
+conda installation path (`YOUR_USERNAME`), or export `CONDA_SH` pointing to your
+installation's `etc/profile.d/conda.sh`. The email address is optional and
+commented out. No personal account or username is included in the template.
+If your site's modules already activate the required environment, export
+`PIPELINE_SKIP_CONDA=true` instead. The submission helper uses Python 3 on the
+login node; the jobs activate `bacteria-RNAseq-pipeline` on their compute nodes.
+
+Keep the input/reference/output folders in `config.env`. The main Slurm settings
+are:
+
+```bash
+FASTQ_DIR="/path/to/reads"
+FASTQ_GLOB="*.fastq*"
+OUTPUT_DIR="/path/to/results"
+SLURM_MAX_SAMPLES="40"
+SLURM_MAX_CONCURRENT="8"
+```
+
+Submit from your Slurm login node:
+
+```bash
+bash submit_bacteria_pipeline.sh config.env
+```
+
+The helper submits all three stages automatically and prints their job IDs:
+
+1. A preparation job combines the reference shards and builds shared BBSplit
+   indexes once.
+2. A sample array depends on successful preparation. Each `SLURM_ARRAY_TASK_ID`
+   selects one immutable manifest entry containing exactly one FASTQ file.
+   With 40 samples, the array is `0-39%8`; smaller folders submit exactly their
+   sample count. Every discovered sample is included. More than 40 samples is
+   an error by default; increase `SLURM_MAX_SAMPLES` to accept a larger run.
+3. A separate final job depends on successful completion of the entire array
+   (`afterok`). It verifies every sample's completion marker and combines all
+   sample rows and featureCounts columns into the final CSVs. It does not rerun
+   alignments. A failed sample prevents the final job from publishing a complete
+   result. Invalid dependencies are cancelled by Slurm.
+
+The array's CPU allocation follows `THREADS`; the preparation job uses the same
+allocation. Each sample writes to its own directory and reads the prepared
+references/indexes without rebuilding or modifying them. The final job requests
+one CPU and 8 GB RAM. Adjust memory/time in the template for your reference sizes
+and cluster. Arrays may run fewer than eight tasks when cluster resources are
+busy; eight is the concurrency limit.
+
+Each FASTQ file creates its own sample job. Filenames such as `sample_R1.fastq.gz`, `sample_R2.fastq.gz`, `sample_1.fastq`, and `sample_2.fastq` remain independent samples with their original name stems; the helper does not combine or rename them. Separate lanes or chunks also remain separate sample jobs when their names differ. Sampling applies independently to each file, and `SAMPLE_SIZE` is its maximum number of reads. For `.fq`/`.fq.gz` files, set `FASTQ_GLOB="*.fq*"`.
+
+Each submission creates a fresh directory, so results from different runs do
+not mix:
+
+```text
+OUTPUT_DIR/slurm_runs/<run-id>/
+├── run.json                          # frozen sample list, settings, job IDs
+├── config.env                        # configuration snapshot
+├── logs/                             # preparation, array, final job logs
+├── shared/bbsplit_alignments/        # references and indexes shared by tasks
+├── samples/<sample>/                 # per-sample reports, alignments, profiles
+├── featurecounts_BACTERIA_*.txt/.csv  # all samples' feature columns
+├── host/featurecounts_HOST_*.txt/.csv # optional combined host feature counts
+├── BACTERIA_<run-id>.csv
+├── BACTERIA_<run-id>_read_breakdown.csv
+└── aggregation.completed.json
+```
+
+The two final summary CSVs contain one row per manifest sample, including empty
+samples. Percentages retain the total-input-read denominator. References are
+prepared from the submitted configuration; changing config files later does not
+change queued jobs. Input paths, sizes, and modification times are recorded and
+checked to detect changed input files. To start another run after a failure,
+correct its cause and submit again; the new submission has its own run directory.
+
+`--prepare-only`, `--prepared-dir`, and `--skip-summary` on
+`map_bacteria_with_decoys.sh` are used internally by the Slurm worker. The normal
+sequential command remains available without those flags.
+
+### Local files and version control
+
+`.gitignore` excludes local `work/` and `tests/` files, Python caches, personal
+config copies, reads, references, alignments, scheduler logs, and pipeline output.
+Existing work and test files have been removed from Git tracking and remain on
+disk locally. The distributed `config.env`, pipeline source, and Slurm template
+remain tracked. Tests can still be run locally with the command above when the
+ignored `tests/` directory is present.
 
 ## Important outputs
 
@@ -266,7 +291,7 @@ Percentages use the original reads reported by Cutadapt as the denominator, or t
 
 ## Notes
 
-- Input files must contain one long molecule per FASTQ record and end in `.fastq` or `.fastq.gz`; use `FASTQ_GLOB` to narrow which files are selected.
+- Input files must contain one Nanopore molecule per FASTQ record and end in `.fastq`, `.fastq.gz`, `.fq`, or `.fq.gz`; use `FASTQ_GLOB` to narrow which files are selected. Every selected file remains an independent sample regardless of numeric or `_R1`/`_R2` filename suffixes.
 - Ensure the configured bacterial reference and annotation use compatible genome versions.
 
 ## Normalized feature-position analysis

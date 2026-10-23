@@ -2,6 +2,23 @@
 set -euo pipefail
 
 CONFIG_FILE="${1:-config.env}"
+if (( $# )); then shift; fi
+PREPARE_ONLY=false
+SKIP_SUMMARY=false
+SHARED_PREPARED_DIR=""
+while (( $# )); do
+  case "$1" in
+    --prepare-only) PREPARE_ONLY=true; shift ;;
+    --skip-summary) SKIP_SUMMARY=true; shift ;;
+    --prepared-dir)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--prepared-dir requires a directory" >&2; exit 1; }
+      SHARED_PREPARED_DIR="$2"; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+if [[ "$PREPARE_ONLY" == true && -n "$SHARED_PREPARED_DIR" ]]; then
+  echo "--prepare-only and --prepared-dir cannot be combined" >&2; exit 1
+fi
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Config file not found: $CONFIG_FILE" >&2
   echo "Usage: bash $0 [config.env]" >&2
@@ -26,10 +43,6 @@ HOST_REFERENCE_DIR="${HOST_REFERENCE_DIR-${HOST_BBSPLIT_REFERENCE:-}}"
 HOST_ENABLED=false
 [[ -z "$HOST_REFERENCE_DIR" ]] || HOST_ENABLED=true
 : "${BBSPLIT_K:=11}"
-: "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
-: "${TRIM_ILLUMINA_ADAPTERS:=false}"
-: "${ADAPTER_ILLUMINA:=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA}"
-: "${ADAPTER_ILLUMINA_SMALL_RNA:=TGGAATTCTCGGGTGCCAAGG}"
 : "${MIN_READ_LENGTH:=20}"
 : "${THREADS:=16}"
 : "${GENE_POSITION_BINS:=100}"
@@ -43,14 +56,41 @@ HOST_ENABLED=false
 [[ "$MIN_READ_LENGTH" =~ ^[1-9][0-9]*$ ]] && (( MIN_READ_LENGTH <= 6000 )) || {
   echo "MIN_READ_LENGTH must be a positive integer no greater than 6000" >&2; exit 1;
 }
-case "${TRIM_ILLUMINA_ADAPTERS,,}" in
-  true|false) ;;
-  *) echo "TRIM_ILLUMINA_ADAPTERS must be true or false" >&2; exit 1 ;;
-esac
-
 shopt -s nullglob
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fastq_files=(); input_sample_names=()
+if [[ "$PREPARE_ONLY" != true ]]; then
+  # Use the same file selection and collision checks as scheduled runs before
+  # preparing references or writing sample outputs. Names come from the selected
+  # filename, including when it is a symlink to a differently named FASTQ.
+  mkdir -p "$OUTPUT_DIR/.pipeline"
+  python3 - "$SCRIPT_DIR" "$FASTQ_DIR" "$FASTQ_GLOB" \
+    "$OUTPUT_DIR/.pipeline/local_samples.json" > "$OUTPUT_DIR/.pipeline/local_samples.inputs" <<'SAMPLES'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sample_manifest import discover_samples
+try:
+    samples = discover_samples(sys.argv[2], sys.argv[3])
+except (ValueError, OSError) as exc:
+    raise SystemExit(f"ERROR: {exc}")
+Path(sys.argv[4]).write_text(json.dumps(samples, indent=2) + "\n")
+for sample in samples:
+    for value in (sample["reads"][0]["path"], sample["sample"]):
+        sys.stdout.buffer.write(os.fsencode(value) + b"\0")
+SAMPLES
+  while IFS= read -r -d '' input_fastq && IFS= read -r -d '' input_sample_name; do
+    fastq_files+=("$input_fastq")
+    input_sample_names+=("$input_sample_name")
+  done < "$OUTPUT_DIR/.pipeline/local_samples.inputs"
+fi
+
 ALIGNMENT_DIR="$OUTPUT_DIR/bbsplit_alignments"
+PREPARED_DIR="${SHARED_PREPARED_DIR:-$ALIGNMENT_DIR}"
+if [[ -n "$SHARED_PREPARED_DIR" && ! -f "$PREPARED_DIR/.prepared" ]]; then
+  echo "Shared references are incomplete: $PREPARED_DIR" >&2; exit 1
+fi
 DECOY_ALIGNMENT_DIR="$ALIGNMENT_DIR/decoy"
 BACTERIA_ALIGNMENT_DIR="$ALIGNMENT_DIR/bacteria"
 HOST_ALIGNMENT_DIR="$ALIGNMENT_DIR/host"
@@ -60,20 +100,22 @@ mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR" "$LEFTOV
 if [[ "$HOST_ENABLED" == true ]]; then
   mkdir -p "$HOST_ALIGNMENT_DIR"
 fi
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$CSV_CONVERSION_SCRIPT" != /* ]]; then
   CSV_CONVERSION_SCRIPT="$SCRIPT_DIR/$CSV_CONVERSION_SCRIPT"
 fi
 
 # Normalize all reference shards and annotation coordinate systems before mapping.
 reference_args=(--decoy-dir "$DECOY_REFERENCE_DIR" --bacteria-dir "$BACTERIA_REFERENCE_DIR"
-  --output-dir "$ALIGNMENT_DIR/references")
+  --output-dir "$PREPARED_DIR/references")
 if [[ "$HOST_ENABLED" == true ]]; then
   reference_args+=(--host-dir "$HOST_REFERENCE_DIR")
 fi
-python3 "$SCRIPT_DIR/prepare_references.py" "${reference_args[@]}"
+if [[ -z "$SHARED_PREPARED_DIR" ]]; then
+  rm -f -- "$PREPARED_DIR/.prepared"
+  python3 "$SCRIPT_DIR/prepare_references.py" "${reference_args[@]}"
+fi
 # Read only fixed manifest fields; generated paths are never evaluated as shell code.
-mapfile -t reference_paths < <(python3 - "$ALIGNMENT_DIR/references/manifest.json" <<'MANIFEST'
+mapfile -t reference_paths < <(python3 - "$PREPARED_DIR/references/manifest.json" <<'MANIFEST'
 import json, sys
 from pathlib import Path
 manifest = json.loads(Path(sys.argv[1]).read_text())
@@ -91,16 +133,20 @@ BACTERIA_DNA_FASTA="${reference_paths[1]}"; BACTERIA_DNA_GFF="${reference_paths[
 BACTERIA_RNA_FASTA="${reference_paths[3]}"; BACTERIA_RNA_GFF="${reference_paths[4]}"
 HOST_DNA_FASTA="${reference_paths[5]}"; HOST_DNA_GFF="${reference_paths[6]}"
 HOST_RNA_FASTA="${reference_paths[7]}"; HOST_RNA_GFF="${reference_paths[8]}"
-BACTERIA_GFF="$ALIGNMENT_DIR/references/bacteria.combined.gff3"
+BACTERIA_GFF="$PREPARED_DIR/references/bacteria.combined.gff3"
 HOST_GFF=""
 BACTERIA_GENE_ATTRIBUTE=gene_id
 HOST_GENE_ATTRIBUTE=gene_id
-cat -- "$BACTERIA_DNA_GFF" > "$BACTERIA_GFF"
-if [[ -n "$BACTERIA_RNA_GFF" ]]; then cat -- "$BACTERIA_RNA_GFF" >> "$BACTERIA_GFF"; fi
 if [[ "$HOST_ENABLED" == true ]]; then
-  HOST_GFF="$ALIGNMENT_DIR/references/host.combined.gff3"
-  cat -- "$HOST_DNA_GFF" > "$HOST_GFF"
-  if [[ -n "$HOST_RNA_GFF" ]]; then cat -- "$HOST_RNA_GFF" >> "$HOST_GFF"; fi
+  HOST_GFF="$PREPARED_DIR/references/host.combined.gff3"
+fi
+if [[ -z "$SHARED_PREPARED_DIR" ]]; then
+  cat -- "$BACTERIA_DNA_GFF" > "$BACTERIA_GFF"
+  if [[ -n "$BACTERIA_RNA_GFF" ]]; then cat -- "$BACTERIA_RNA_GFF" >> "$BACTERIA_GFF"; fi
+  if [[ "$HOST_ENABLED" == true ]]; then
+    cat -- "$HOST_DNA_GFF" > "$HOST_GFF"
+    if [[ -n "$HOST_RNA_GFF" ]]; then cat -- "$HOST_RNA_GFF" >> "$HOST_GFF"; fi
+  fi
 fi
 
 # Each stage, k value, and reference content uses an isolated index. BBSplit's
@@ -120,9 +166,25 @@ run_bbsplit() {
 prepare_bbsplit_index() {
   local fasta_file="$1" stage="$2"
   local fingerprint index_dir
+  if [[ -n "$SHARED_PREPARED_DIR" ]]; then
+    # The preparation job already checksummed the large reference files.
+    # Workers load its frozen index paths instead of re-reading human genomes.
+    index_dir=$(python3 - "$PREPARED_DIR/indexes.json" "$stage" "$BBSPLIT_K" <<'INDEX'
+import json, sys
+from pathlib import Path
+indexes = json.loads(Path(sys.argv[1]).read_text())
+if indexes["k"] != sys.argv[3]:
+    raise SystemExit("Shared indexes use a different BBSPLIT_K")
+print(indexes["stages"][sys.argv[2]])
+INDEX
+) || return 1
+    [[ -f "$index_dir/.ready" ]] || { echo "Shared index is incomplete: $index_dir" >&2; return 1; }
+    printf '%s\n' "$index_dir"
+    return 0
+  fi
   fingerprint=$(sha256sum "$fasta_file") || return 1
   fingerprint=${fingerprint%% *}
-  index_dir="$ALIGNMENT_DIR/indexes/$stage/k$BBSPLIT_K/$fingerprint"
+  index_dir="$PREPARED_DIR/indexes/$stage/k$BBSPLIT_K/$fingerprint"
   mkdir -p "$index_dir" || return 1
   echo "preparing $stage BBSplit index from $fasta_file ..." >&2
   # Explicit set names keep FASTA filenames out of SAM sequence identifiers.
@@ -133,6 +195,7 @@ prepare_bbsplit_index() {
     cat "$index_dir/index.stderr.txt" >&2
     return 1
   fi
+  touch "$index_dir/.ready"
   printf '%s\n' "$index_dir"
 }
 
@@ -149,13 +212,21 @@ if [[ "$HOST_ENABLED" == true ]]; then
   fi
 fi
 
-matched_fastqs=("$FASTQ_DIR"/$FASTQ_GLOB)
-if (( ${#matched_fastqs[@]} == 0 )); then
-  echo "No FASTQ files found in $FASTQ_DIR matching $FASTQ_GLOB" >&2
-  exit 1
+if [[ -z "$SHARED_PREPARED_DIR" ]]; then
+  python3 - "$PREPARED_DIR/indexes.json" "$BBSPLIT_K" \
+    "$DECOY_BBSPLIT_INDEX" "$BACTERIA_DNA_INDEX" "$BACTERIA_RNA_INDEX" \
+    "${HOST_DNA_INDEX:-}" "$HOST_RNA_INDEX" <<'INDEXES'
+import json, sys
+from pathlib import Path
+names = ("decoy", "bacteria", "bacteria_rna", "host", "host_rna")
+Path(sys.argv[1]).write_text(json.dumps({"k": sys.argv[2], "stages": dict(zip(names, sys.argv[3:]))}, indent=2) + "\n")
+INDEXES
+  touch "$PREPARED_DIR/.prepared"
 fi
-
-fastq_files=("${matched_fastqs[@]}")
+if [[ "$PREPARE_ONLY" == true ]]; then
+  echo "Shared reference preparation complete: $PREPARED_DIR"
+  exit 0
+fi
 
 # Randomly subsample complete FASTQ records with reservoir sampling. This keeps
 # memory use bounded by SAMPLE_SIZE even for very large input files.
@@ -171,7 +242,7 @@ import sys
 input_path, output_path, sample_size, seed = sys.argv[1:]
 sample_size = int(sample_size)
 rng = random.Random(f"{seed}:{hashlib.sha256(input_path.encode()).hexdigest()}")
-opener = gzip.open if input_path.endswith(".gz") else open
+opener = gzip.open if input_path.lower().endswith(".gz") else open
 reservoir = []
 
 with opener(input_path, "rt") as source:
@@ -203,8 +274,9 @@ case "${SAMPLE_READS,,}" in
     rm -rf "$sample_dir"
     mkdir -p "$sample_dir"
     sampled_fastqs=()
-    for input_fastq in "${fastq_files[@]}"; do
-      sampled_fastq="$sample_dir/$(basename "${input_fastq%.gz}")"
+    for idx in "${!fastq_files[@]}"; do
+      input_fastq="${fastq_files[$idx]}"
+      sampled_fastq="$sample_dir/${input_sample_names[$idx]}.fastq"
       echo "sampling up to $SAMPLE_SIZE reads from $(basename "$input_fastq") ..."
       sample_fastq "$input_fastq" "$sampled_fastq"
       sampled_fastqs+=("$sampled_fastq")
@@ -218,8 +290,8 @@ esac
 # Complete all adapter trimming and the minimum length filter before routing
 # reads above 6000 bp out of the alignment/analysis pipeline.
 trimmed_fastqs=(); sample_names=()
-for input_fastq in "${fastq_files[@]}"; do
-  filename=$(basename "$input_fastq"); filename=${filename%.gz}; sample=${filename%.fastq}
+for idx in "${!fastq_files[@]}"; do
+  input_fastq="${fastq_files[$idx]}"; sample="${input_sample_names[$idx]}"
   trimmed_fastq="$OUTPUT_DIR/${sample}_${MIN_READ_LENGTH}bp.trim.fastq"
   all_trimmed_fastq="$OUTPUT_DIR/.${sample}_${MIN_READ_LENGTH}bp.adapter_trimmed.fastq"
   bash "$SCRIPT_DIR/trim_fastq.sh" "$CONFIG_FILE" "$input_fastq" "$all_trimmed_fastq" \
@@ -389,9 +461,11 @@ do
     python3 "$SCRIPT_DIR/gene_position_profile.py" "${profile_args[@]}"
 done
 
-# Run python script to convert results to csv file.
+# Run project summaries after all samples, or defer to the dependent Slurm job.
+if [[ "$SKIP_SUMMARY" != true ]]; then
 (
   cd "$OUTPUT_DIR"
   python3 "$CSV_CONVERSION_SCRIPT"
   python3 "$SCRIPT_DIR/read_breakdown_csv.py" --host-enabled "$HOST_ENABLED"
 )
+fi
