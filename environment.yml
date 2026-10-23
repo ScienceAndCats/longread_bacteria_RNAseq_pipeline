@@ -1,4 +1,4 @@
-name: bacteria-RNAseq-pipeline
+name: longread-bacteria-RNAseq-pipeline
 channels:
   - conda-forge
   - bioconda

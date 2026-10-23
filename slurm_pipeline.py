@@ -66,7 +66,7 @@ def read_config(path):
     config["CSV_CONVERSION_SCRIPT"] = str(converter if converter.is_absolute() else REPOSITORY / converter)
     config.setdefault("FASTQ_GLOB", "*.fastq*")
     config.setdefault("CONDA_SH", "")
-    config.setdefault("CONDA_ENV", "bacteria-RNAseq-pipeline")
+    config.setdefault("CONDA_ENV", "longread-bacteria-RNAseq-pipeline")
     config.setdefault("PIPELINE_SKIP_CONDA", "false")
     config.setdefault("SLURM_MAIL_USER", "")
     config.setdefault("SLURM_MAIL_TYPE", "END,FAIL")

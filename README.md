@@ -38,7 +38,7 @@ The shell pipeline also requires `sha256sum` (GNU coreutils) to identify referen
 
 ```bash
 conda env create -f environment.yml
-conda activate bacteria-RNAseq-pipeline
+conda activate longread-bacteria-RNAseq-pipeline
 ```
 
 If you are running on an HPC system that requires module loading, load your site-specific conda or mamba module before creating or activating the environment.
@@ -57,7 +57,7 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `SLURM_MAIL_USER` | Your notification email address; leave empty to disable job emails. |
 | `SLURM_MAIL_TYPE` | Slurm notification events (default: `END,FAIL`); used when an email address is set. |
 | `CONDA_SH` | Path to your conda installation's `etc/profile.d/conda.sh`. |
-| `CONDA_ENV` | Conda environment name or path to activate on compute nodes (default: `bacteria-RNAseq-pipeline`). |
+| `CONDA_ENV` | Conda environment name or path to activate on compute nodes (default: `longread-bacteria-RNAseq-pipeline`). |
 | `PIPELINE_SKIP_CONDA` | Set `true` only when your site's job setup already activates the required environment (default: `false`). |
 | `OUTPUT_DIR` | Directory where output files should be written. |
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
@@ -191,7 +191,7 @@ SLURM_ACCOUNT="YOUR_PACE_ACCOUNT"
 SLURM_MAIL_USER="YOUR_USERNAME@example.edu"
 SLURM_MAIL_TYPE="END,FAIL"
 CONDA_SH="/path/to/YOUR_USERNAME/miniforge3/etc/profile.d/conda.sh"
-CONDA_ENV="bacteria-RNAseq-pipeline"
+CONDA_ENV="longread-bacteria-RNAseq-pipeline"
 PIPELINE_SKIP_CONDA="false"
 ```
 
