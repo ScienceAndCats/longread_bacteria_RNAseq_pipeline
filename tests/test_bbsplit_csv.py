@@ -42,6 +42,11 @@ def fixture(directory, *, host=False, sample="sample", minimum=22, empty=False):
     write_metrics(bacteria_path, {
         "input": eligible - decoy, "aligned": bacteria, "unmapped": eligible - decoy - bacteria,
     })
+    bacteria_categories = alignment_dir / "bacteria" / f"BACTERIA_{stem}.categories.tsv"
+    write_metrics(bacteria_categories, {
+        "aligned": bacteria, "CDS": 0 if empty else 1, "rRNA": bacteria_rrna,
+        "other_RNA": 0, "intergenic_unannotated": 0 if empty else 1,
+    })
     (directory / "featurecounts_BACTERIA_rRNA.txt.summary").write_text(
         f"Status\t{alignment_dir / 'bacteria' / f'BACTERIA_{stem}.sam'}\nAssigned\t{bacteria_rrna}\n"
     )
@@ -50,6 +55,10 @@ def fixture(directory, *, host=False, sample="sample", minimum=22, empty=False):
         host_path = host_dir / f"HOST_{stem}.bbsplit.txt"
         host_input = eligible - decoy - bacteria
         write_metrics(host_path, {"input": host_input, "aligned": host_aligned, "unmapped": host_input - host_aligned})
+        write_metrics(host_dir / f"HOST_{stem}.categories.tsv", {
+            "aligned": host_aligned, "CDS": 0, "rRNA": host_rrna,
+            "other_RNA": 0 if empty else 1, "intergenic_unannotated": 0,
+        })
         (host_dir / "featurecounts_HOST_rRNA.txt.summary").write_text(
             f"Status\t{host_dir / f'HOST_{stem}.sam'}\nAssigned\t{host_rrna}\n"
         )
@@ -68,7 +77,7 @@ def fixture(directory, *, host=False, sample="sample", minimum=22, empty=False):
         "oversized": oversized, "decoy": decoy, "bacteria": bacteria,
         "host": host_aligned, "leftover": eligible - decoy - bacteria - host_aligned,
         "length": directory / f"{stem}.length_filter.tsv", "decoy_path": decoy_path,
-        "bacteria_path": bacteria_path,
+        "bacteria_path": bacteria_path, "bacteria_categories": bacteria_categories,
     }
 
 
@@ -92,8 +101,15 @@ class ReadBreakdownTests(unittest.TestCase):
                                      ("Decoy aligned", "Bacteria aligned", "Host aligned", "Leftover reads")))
                     self.assertEqual(counts["Bacteria aligned"], counts["Bacteria non-rRNA"] + counts["Bacteria rRNA"])
                     self.assertEqual(counts["Host aligned"], counts["Host non-rRNA"] + counts["Host rRNA"])
+                    for label in ("Bacteria", "Host"):
+                        self.assertEqual(counts[f"{label} aligned"], sum(counts[f"{label} {category}"]
+                                         for category in ("CDS", "rRNA", "other RNA", "intergenic/unannotated")))
+                    self.assertEqual(counts["Bacteria CDS"], 1)
+                    self.assertEqual(counts["Bacteria intergenic/unannotated"], 1)
+                    self.assertEqual(counts["Host other RNA"], int(host))
                     self.assertIn("length_filter.tsv", sources[OVERSIZED])
                     self.assertIn("bbsplit_alignments", sources["Bacteria aligned"])
+                    self.assertIn("categories.tsv", sources["Bacteria rRNA"])
 
     def test_empty_and_all_excluded_reads_are_reported_without_leftovers(self):
         for empty in (False, True):
@@ -107,6 +123,7 @@ class ReadBreakdownTests(unittest.TestCase):
                     (directory / "featurecounts_BACTERIA_rRNA.txt.summary").write_text(
                         "Status\tBACTERIA_sample_22bp.sam\nAssigned\t0\n"
                     )
+                    write_metrics(expected["bacteria_categories"], dict.fromkeys(read_breakdown_csv.CATEGORY_METRICS, 0))
                 _, counts, _ = read_breakdown_csv.build_table(directory)[0]
                 self.assertEqual(counts[ELIGIBLE], 0)
                 self.assertEqual(counts[OVERSIZED], 0 if empty else 10)
@@ -139,13 +156,11 @@ class ReadBreakdownTests(unittest.TestCase):
                     write_metrics(directory / "bbsplit_alignments/host/HOST_sample_22bp.bbsplit.txt",
                                   {"input": 4, "aligned": 2, "unmapped": 2})
                 elif invalid == "bacterial rrna":
-                    (directory / "featurecounts_BACTERIA_rRNA.txt.summary").write_text(
-                        "Status\tBACTERIA_sample_22bp.sam\nAssigned\t4\n"
-                    )
+                    write_metrics(directory / "bbsplit_alignments/bacteria/BACTERIA_sample_22bp.categories.tsv",
+                                  {"aligned": 3, "CDS": 1, "rRNA": 4, "other_RNA": 0, "intergenic_unannotated": 0})
                 else:
-                    (directory / "bbsplit_alignments/host/featurecounts_HOST_rRNA.txt.summary").write_text(
-                        "Status\tHOST_sample_22bp.sam\nAssigned\t3\n"
-                    )
+                    write_metrics(directory / "bbsplit_alignments/host/HOST_sample_22bp.categories.tsv",
+                                  {"aligned": 2, "CDS": 0, "rRNA": 3, "other_RNA": 0, "intergenic_unannotated": 0})
                 with self.assertRaises(ValueError):
                     read_breakdown_csv.build_table(directory)
 
@@ -162,9 +177,100 @@ class ReadBreakdownTests(unittest.TestCase):
             self.assertEqual(rows[0]["Sample"], "sample, comment")
             self.assertEqual(rows[0][f"{OVERSIZED} (reads)"], "2")
             self.assertEqual(rows[0][f"{OVERSIZED} (% of total reads)"], "15.38%")
+            self.assertEqual(rows[0]["Bacteria CDS (reads)"], "1")
+            self.assertEqual(rows[0]["Bacteria CDS (% of total reads)"], "7.69%")
+            self.assertEqual(rows[0]["Bacteria intergenic/unannotated (reads)"], "1")
+            self.assertEqual(rows[0]["Host other RNA (% of total reads)"], "0.00%")
+
+    def test_category_metrics_reject_incomplete_negative_or_inconsistent_reports(self):
+        invalid_metrics = (
+            {"aligned": 3, "CDS": 1, "rRNA": 1, "other_RNA": 0},
+            {"aligned": 3, "CDS": 2, "rRNA": 1, "other_RNA": 1, "intergenic_unannotated": 0},
+            {"aligned": 2, "CDS": 1, "rRNA": 1, "other_RNA": 0, "intergenic_unannotated": 0},
+            {"aligned": 3, "CDS": -1, "rRNA": 1, "other_RNA": 1, "intergenic_unannotated": 2},
+        )
+        for metrics in invalid_metrics:
+            with self.subTest(metrics=metrics), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                paths = fixture(directory)
+                write_metrics(paths["bacteria_categories"], metrics)
+                with self.assertRaises(ValueError):
+                    read_breakdown_csv.build_table(directory)
+
+    def test_category_reports_replace_independent_featurecounts_rrna_assignments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fixture(directory, host=True)
+            # Independent feature assignments can overlap CDS and RNA classes.
+            # Only the exclusive classifier contributes to read disposition.
+            (directory / "featurecounts_BACTERIA_rRNA.txt.summary").unlink()
+            (directory / "bbsplit_alignments/host/featurecounts_HOST_rRNA.txt.summary").unlink()
+            _, counts, _ = read_breakdown_csv.build_table(directory)[0]
+            self.assertEqual(counts["Bacteria rRNA"], 1)
+            self.assertEqual(counts["Host rRNA"], 1)
+            self.assertEqual(counts["Host other RNA"], 1)
+
+    def test_explicit_host_disabled_ignores_reports_from_an_earlier_host_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fixture(directory, host=True)
+            _, counts, sources = read_breakdown_csv.build_table(directory, host_enabled=False)[0]
+            self.assertEqual(counts["Host aligned"], 0)
+            self.assertEqual(counts["Host rRNA"], 0)
+            self.assertEqual(counts["Host other RNA"], 0)
+            self.assertEqual(counts["Leftover reads"], 3)
+            self.assertEqual(sources["Host CDS"], "Host alignment not configured")
+            destination = directory / "breakdown.csv"
+            subprocess.run([sys.executable, str(REPO / "read_breakdown_csv.py"),
+                            "--output-dir", str(directory), "--output", str(destination),
+                            "--host-enabled", "false"], check=True)
+            with destination.open(newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["Host aligned (reads)"], "0")
+            self.assertEqual(row["Leftover reads (reads)"], "3")
+
+    def test_missing_category_report_cannot_silently_be_reported_as_zero(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            paths = fixture(directory)
+            paths["bacteria_categories"].unlink()
+            with self.assertRaises(FileNotFoundError):
+                read_breakdown_csv.build_table(directory)
 
 
 class MainSummaryTests(unittest.TestCase):
+    def test_rna_only_alignments_keep_organism_total_and_zero_genomic_coverage(self):
+        for dna_input in (0, 3):
+            with self.subTest(dna_input=dna_input), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                fixture(directory)
+                # All three bacterial alignments came from the RNA stage.
+                # With host RNA enabled, the chronological DNA input can also
+                # be empty even though the virtual organism input is six.
+                write_metrics(directory / "bbsplit_alignments/bacteria/dna/BACTERIA_sample_22bp.bbsplit.txt",
+                              {"input": dna_input, "aligned": 0, "unmapped": dna_input})
+                (directory / "bbsplit_alignments/bacteria/BACTERIA_sample_22bp_coverage.txt").write_text("")
+                subprocess.run([sys.executable, str(REPO / "bacteria_with_decoys_csvConversion.py")],
+                               cwd=directory, check=True)
+                with (directory / f"BACTERIA_{directory.name}.csv").open(newline="") as handle:
+                    row = {key.strip(): value for key, value in next(csv.DictReader(handle)).items()}
+                self.assertEqual(row["Overall Allignment"], "3")
+                self.assertEqual(row["Percent Covered"], "0")
+                self.assertEqual(row["Mean Coverage"], "0")
+                self.assertEqual(row["Reads Assigned to features"], "2")
+
+    def test_empty_genomic_coverage_is_rejected_when_dna_stage_has_mapped_reads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            fixture(directory)
+            write_metrics(directory / "bbsplit_alignments/bacteria/dna/BACTERIA_sample_22bp.bbsplit.txt",
+                          {"input": 4, "aligned": 1, "unmapped": 3})
+            (directory / "bbsplit_alignments/bacteria/BACTERIA_sample_22bp_coverage.txt").write_text("")
+            result = subprocess.run([sys.executable, str(REPO / "bacteria_with_decoys_csvConversion.py")],
+                                    cwd=directory, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unexpected coverage report format", result.stderr)
+
     def test_actual_empty_cutadapt_and_coverage_reports_produce_zero_counts(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)

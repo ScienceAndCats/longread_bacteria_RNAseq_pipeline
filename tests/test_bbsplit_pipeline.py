@@ -193,6 +193,10 @@ class BBSplitPipelineTests(unittest.TestCase):
                               ("Bacteria rRNA", 1), ("Host aligned", int(host_enabled)),
                               ("Leftover reads", 1 if host_enabled else 2)):
             self.assertEqual(int(mixed[f"{column} (reads)"]), value, column)
+        for organism, cds in (("Bacteria", 2), ("Host", int(host_enabled))):
+            self.assertEqual(int(mixed[f"{organism} CDS (reads)"]), cds)
+            self.assertEqual(int(mixed[f"{organism} other RNA (reads)"]), 0)
+            self.assertEqual(int(mixed[f"{organism} intergenic/unannotated (reads)"]), 0)
         self.assertEqual(mixed[f"{OVERSIZED} (% of total reads)"], "12.50%")
         self.assertEqual(main_rows["mixed"]["Overall Allignment"], "3")
         self.assertEqual(main_rows["mixed"]["Reads Assigned to features"], "2")
@@ -230,6 +234,165 @@ class BBSplitPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output, expected, excluded = self.pipeline(Path(temp), host_enabled=False, k=9)
             self.verify_pipeline(output, expected, excluded, host_enabled=False, k=9)
+
+
+@unittest.skipIf(bool(MISSING) or importlib.util.find_spec("Bio") is None,
+                 "Requires real pipeline tools and Biopython")
+class FolderReferencePipelineTests(unittest.TestCase):
+    """Exercise NCBI directory layouts, RNA priority, and exclusive categories."""
+
+    def make_fixture(self, directory):
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import FeatureLocation, SeqFeature
+        from Bio.SeqRecord import SeqRecord
+
+        rng = random.Random(481749)
+        bacteria = random_sequence(rng, 4000)
+        host = random_sequence(rng, 4000)
+        # This host transcript also matches unannotated bacterial DNA. Mapping
+        # host RNA before bacterial DNA must assign its read to the host CDS.
+        host = host[:100] + bacteria[3100:3500] + host[500:]
+        decoy = random_sequence(rng, 1200)
+        unrelated = random_sequence(rng, 120)
+        references = directory / "reference genomes"
+        bacteria_dir = references / "PAO1"
+        decoy_dir = references / "decoy"
+        host_dir = references / "human"
+        host_dna = host_dir / "human_DNA"
+        host_rna = host_dir / "human_RNA"
+        for path in (bacteria_dir, decoy_dir, host_dna, host_rna):
+            path.mkdir(parents=True)
+
+        def write_gzip(path, contents):
+            with gzip.open(path, "wt") as handle:
+                handle.write(contents)
+
+        (decoy_dir / "Gina_Pangenome.fasta").write_text(f">decoy_ref\n{decoy}\n")
+        # Existing indexes are unrelated to discovery and must be ignored.
+        (decoy_dir / "Gina_Pangenome.mmi").write_bytes(b"unrelated minimap index")
+        (decoy_dir / "Gina_Pangenome.1.bt2l").write_bytes(b"unrelated bowtie index")
+        write_gzip(bacteria_dir / "GCF_fixture_genomic.fna.gz", f">bacteria_ref\n{bacteria}\n")
+        write_gzip(host_dna / "GCF_fixture_genomic.fna.gz", f">host_ref\n{host}\n")
+
+        features = (("CDS", 101, 500, "cds"), ("rRNA", 701, 1100, "rrna"),
+                    ("tRNA", 1301, 1700, "trna"), ("CDS", 1901, 2300, "dna_cds"))
+        for label, path in (("bacteria", bacteria_dir), ("host", host_dna)):
+            annotation = "##gff-version 3\n" + "".join(
+                f"{label}_ref\ttest\t{kind}\t{start}\t{end}\t.\t+\t"
+                f"{'0' if kind == 'CDS' else '.'}\tID={label}_{ident};locus_tag={label}_{ident}\n"
+                for kind, start, end, ident in features)
+            write_gzip(path / "GCF_fixture_genomic.gff.gz", annotation)
+
+        write_gzip(bacteria_dir / "GCF_fixture_cds_from_genomic.fna.gz",
+                   ">lcl|bacteria_ref_cds_1 [locus_tag=bacteria_cds] [protein_id=TEST_1] "
+                   f"[location=101..500] [gbkey=CDS]\n{bacteria[100:500]}\n")
+        write_gzip(bacteria_dir / "GCF_fixture_rna_from_genomic.fna.gz",
+                   ">lcl|bacteria_ref_rna_1 [locus_tag=bacteria_rrna] [location=701..1100] "
+                   f"[gbkey=rRNA]\n{bacteria[700:1100]}\n"
+                   ">lcl|bacteria_ref_rna_2 [locus_tag=bacteria_trna] [location=1301..1700] "
+                   f"[gbkey=tRNA]\n{bacteria[1300:1700]}\n")
+
+        # Separate RNA shards use transcript coordinates in their GenBank
+        # records, deliberately distinct from the genomic GFF coordinates.
+        for shard, records in ((1, (("NM_SYNTHETIC.1", host[100:500], "CDS", "host_cds"),)),
+                               (2, (("NR_SYNTHETIC.1", host[700:1100], "rRNA", "host_rrna"),
+                                    ("NR_SYNTHETIC.2", host[1300:1700], "tRNA", "host_trna")))):
+            parsed = []
+            for ident, sequence, kind, gene in records:
+                record = SeqRecord(Seq(sequence), id=ident, name=ident, description="synthetic RNA")
+                record.annotations["molecule_type"] = "mRNA" if kind == "CDS" else "RNA"
+                record.features = [SeqFeature(FeatureLocation(0, len(sequence), strand=1),
+                                              type=kind, qualifiers={"locus_tag": [gene], "gene": [gene]})]
+                parsed.append(record)
+            with gzip.open(host_rna / f"human.{shard}.rna.fna.gz", "wt") as handle:
+                SeqIO.write(parsed, handle, "fasta")
+            with gzip.open(host_rna / f"human.{shard}.rna.gbff.gz", "wt") as handle:
+                SeqIO.write(parsed, handle, "genbank")
+
+        reads = [("decoy", decoy[200:320]), ("bacteria_cds", bacteria[150:270]),
+                 ("bacteria_rrna", bacteria[750:870]), ("bacteria_other", bacteria[1350:1470]),
+                 ("bacteria_dna_cds", bacteria[1950:2070]), ("bacteria_intergenic", bacteria[2550:2670]),
+                 ("host_rna_beats_bacteria_dna", host[150:270]), ("host_rrna", host[750:870]),
+                 ("host_other", host[1350:1470]), ("host_dna_cds", host[1950:2070]),
+                 ("host_intergenic", host[2550:2670]), ("leftover", unrelated)]
+        inputs = directory / "input reads"
+        inputs.mkdir()
+        write_fastq(inputs / "folder_sample.fastq.gz", reads)
+        write_fastq(inputs / "empty.fastq.gz", [])
+        return decoy_dir, bacteria_dir, host_dir, inputs, reads
+
+    def test_rna_shards_before_dna_and_all_read_categories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            decoy, bacteria, host, inputs, reads = self.make_fixture(directory)
+            output = directory / "folder output"
+            settings = {"DECOY_REFERENCE_DIR": str(decoy), "BACTERIA_REFERENCE_DIR": str(bacteria),
+                        "HOST_REFERENCE_DIR": str(host), "FASTQ_DIR": str(inputs),
+                        "FASTQ_GLOB": "*.fastq*", "OUTPUT_DIR": str(output), "THREADS": "1",
+                        "MIN_READ_LENGTH": "20", "GENE_POSITION_BINS": "10",
+                        "METAGENE_MIN_FEATURE_READS": "1", "ADAPTER_TRIMMING_MODE": "legacy"}
+            config = directory / "folders.env"
+            config.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items()))
+            wrapper_dir = directory / "tool wrappers"
+            wrapper_dir.mkdir()
+            mapper = shutil.which("bbsplit.sh")
+            wrapper = wrapper_dir / "bbsplit.sh"
+            wrapper.write_text(f"#!/usr/bin/env bash\nexec {shlex.quote(mapper)} -Xmx1g \"$@\"\n")
+            wrapper.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(["bash", str(REPO / "map_bacteria_with_decoys.sh"), str(config)],
+                                    cwd=directory, env=environment, text=True, capture_output=True, timeout=300)
+            self.assertEqual(result.returncode, 0,
+                             f"stdout:\n{result.stdout[-5000:]}\nstderr:\n{result.stderr[-16000:]}")
+
+            alignments = output / "bbsplit_alignments"
+            expected_stages = (("bacteria", "rna", 11, 3, 8), ("host", "rna", 8, 3, 5),
+                               ("bacteria", "dna", 5, 2, 3), ("host", "dna", 3, 2, 1))
+            for organism, molecule, incoming, aligned, unmapped in expected_stages:
+                report = (alignments / organism / molecule /
+                          f"{organism.upper()}_folder_sample_20bp.bbsplit.txt")
+                self.assertEqual(read_metrics(report), {"input": incoming, "aligned": aligned, "unmapped": unmapped},
+                                 (organism, molecule))
+            for organism in ("bacteria", "host"):
+                report = alignments / organism / f"{organism.upper()}_folder_sample_20bp.categories.tsv"
+                self.assertEqual(read_metrics(report), {"aligned": 5, "CDS": 2, "rRNA": 1,
+                                                        "other_RNA": 1, "intergenic_unannotated": 1})
+
+            rows = read_csv(output / f"BACTERIA_{output.name}_read_breakdown.csv")
+            self.assertEqual({row["Sample"] for row in rows}, {"folder_sample", "empty"})
+            empty = next(row for row in rows if row["Sample"] == "empty")
+            for key, value in empty.items():
+                if key.endswith(" (reads)"):
+                    self.assertEqual(int(value), 0, key)
+                elif key.endswith(" (% of total reads)"):
+                    self.assertEqual(value, "0.00%", key)
+            for organism, molecule, *_ in expected_stages:
+                report = (alignments / organism / molecule /
+                          f"{organism.upper()}_empty_20bp.bbsplit.txt")
+                self.assertEqual(read_metrics(report), {"input": 0, "aligned": 0, "unmapped": 0})
+            row = next(row for row in rows if row["Sample"] == "folder_sample")
+            self.assertEqual(int(row["Total reads (reads)"]), len(reads))
+            self.assertEqual(int(row["Decoy aligned (reads)"]), 1)
+            self.assertEqual(int(row["Leftover reads (reads)"]), 1)
+            for organism in ("Bacteria", "Host"):
+                for category, expected in (("CDS", 2), ("rRNA", 1), ("other RNA", 1),
+                                           ("intergenic/unannotated", 1), ("aligned", 5)):
+                    column = f"{organism} {category}"
+                    self.assertEqual(int(row[f"{column} (reads)"]), expected, column)
+                    self.assertEqual(row[f"{column} (% of total reads)"], f"{expected * 100 / len(reads):.2f}%")
+                    self.assertTrue(row[f"{column} source"])
+            self.assertEqual(read_fastq(alignments / "leftover_reads/folder_sample_20bp_leftover.fastq.gz"),
+                             [("leftover", reads[-1][1], "I" * len(reads[-1][1]))])
+            import pysam
+            for organism in ("bacteria", "host"):
+                sam = alignments / organism / f"{organism.upper()}_folder_sample_20bp.sam"
+                with pysam.AlignmentFile(sam, "r") as handle:
+                    mapped = [record.query_name for record in handle if not record.is_unmapped]
+                expected = {name for name, _ in reads if name.startswith(organism + "_")}
+                self.assertEqual(set(mapped), expected)
+                self.assertEqual(len(mapped), len(expected))
 
 
 if __name__ == "__main__":

@@ -17,9 +17,14 @@ source "$CONFIG_FILE"
 : "${SAMPLE_READS:=false}"
 : "${SAMPLE_SIZE:=5000}"
 : "${SAMPLE_SEED:=1}"
-: "${DECOY_BBSPLIT_REFERENCE:?Set DECOY_BBSPLIT_REFERENCE in $CONFIG_FILE}"
-: "${BACTERIA_BBSPLIT_REFERENCE:?Set BACTERIA_BBSPLIT_REFERENCE in $CONFIG_FILE}"
-: "${HOST_BBSPLIT_REFERENCE:=}"
+# Legacy basename settings remain usable, but new configurations use folders.
+DECOY_REFERENCE_DIR="${DECOY_REFERENCE_DIR-${DECOY_BBSPLIT_REFERENCE:-}}"
+BACTERIA_REFERENCE_DIR="${BACTERIA_REFERENCE_DIR-${BACTERIA_BBSPLIT_REFERENCE:-}}"
+HOST_REFERENCE_DIR="${HOST_REFERENCE_DIR-${HOST_BBSPLIT_REFERENCE:-}}"
+: "${DECOY_REFERENCE_DIR:?Set DECOY_REFERENCE_DIR in $CONFIG_FILE}"
+: "${BACTERIA_REFERENCE_DIR:?Set BACTERIA_REFERENCE_DIR in $CONFIG_FILE}"
+HOST_ENABLED=false
+[[ -z "$HOST_REFERENCE_DIR" ]] || HOST_ENABLED=true
 : "${BBSPLIT_K:=11}"
 : "${ADAPTER_NANOPORE:=TTTCTGTTGGTGCTGATATTGC}"
 : "${TRIM_ILLUMINA_ADAPTERS:=false}"
@@ -45,68 +50,6 @@ esac
 
 shopt -s nullglob
 
-# Locate the single annotation whose filename starts with the reference
-# basename and a .gff suffix (for example, reference.gff or reference.gff3).
-find_gff_annotation() {
-  local reference_basename="$1"
-  local reference_label="$2"
-  local candidates=("${reference_basename}".gff*)
-
-  if (( ${#candidates[@]} == 0 )); then
-    echo "ERROR: $reference_label annotation not found; expected ${reference_basename}.gff*" >&2
-    return 1
-  fi
-  if (( ${#candidates[@]} > 1 )); then
-    echo "ERROR: Multiple $reference_label annotations match ${reference_basename}.gff*: ${candidates[*]}" >&2
-    return 1
-  fi
-  printf '%s\n' "${candidates[0]}"
-}
-
-# Prefer the locus attribute for featureCounts gene IDs, falling back first to
-# locus_tag and then to gene when the preferred attributes do not occur.
-find_gene_identifier_attribute() {
-  local annotation_file="$1"
-
-  if [[ "$annotation_file" == *.gz ]]; then
-    gzip -cd -- "$annotation_file"
-  else
-    cat -- "$annotation_file"
-  fi | awk -F '\t' '
-    !/^#/ && NF >= 9 {
-      attribute_count = split($9, attributes, ";")
-      for (i = 1; i <= attribute_count; i++) {
-        sub(/^[[:space:]]+/, "", attributes[i])
-        split(attributes[i], parts, /[=[:space:]]/)
-        if (parts[1] == "locus") has_locus = 1
-        if (parts[1] == "locus_tag") has_locus_tag = 1
-        if (parts[1] == "gene") has_gene = 1
-      }
-    }
-    END {
-      if (has_locus) print "locus"
-      else if (has_locus_tag) print "locus_tag"
-      else if (has_gene) print "gene"
-      else exit 1
-    }
-  '
-}
-
-BACTERIA_GFF=$(find_gff_annotation "$BACTERIA_BBSPLIT_REFERENCE" "bacterial")
-if ! BACTERIA_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$BACTERIA_GFF"); then
-  echo "ERROR: bacterial annotation has none of the locus, locus_tag, or gene attributes: $BACTERIA_GFF" >&2
-  exit 1
-fi
-HOST_GFF=""
-HOST_GENE_ATTRIBUTE=""
-if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
-  HOST_GFF=$(find_gff_annotation "$HOST_BBSPLIT_REFERENCE" "host")
-  if ! HOST_GENE_ATTRIBUTE=$(find_gene_identifier_attribute "$HOST_GFF"); then
-    echo "ERROR: host annotation has none of the locus, locus_tag, or gene attributes: $HOST_GFF" >&2
-    exit 1
-  fi
-fi
-
 ALIGNMENT_DIR="$OUTPUT_DIR/bbsplit_alignments"
 DECOY_ALIGNMENT_DIR="$ALIGNMENT_DIR/decoy"
 BACTERIA_ALIGNMENT_DIR="$ALIGNMENT_DIR/bacteria"
@@ -114,7 +57,7 @@ HOST_ALIGNMENT_DIR="$ALIGNMENT_DIR/host"
 LEFTOVER_READS_DIR="$ALIGNMENT_DIR/leftover_reads"
 OVERSIZED_READS_DIR="$ALIGNMENT_DIR/oversized_reads"
 mkdir -p "$OUTPUT_DIR" "$DECOY_ALIGNMENT_DIR" "$BACTERIA_ALIGNMENT_DIR" "$LEFTOVER_READS_DIR" "$OVERSIZED_READS_DIR"
-if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
+if [[ "$HOST_ENABLED" == true ]]; then
   mkdir -p "$HOST_ALIGNMENT_DIR"
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -122,21 +65,43 @@ if [[ "$CSV_CONVERSION_SCRIPT" != /* ]]; then
   CSV_CONVERSION_SCRIPT="$SCRIPT_DIR/$CSV_CONVERSION_SCRIPT"
 fi
 
-# Reference basenames keep annotation discovery unchanged. BBSplit requires
-# FASTA references and stores its own indexes beneath the output directory.
-find_reference_fasta() {
-  local reference_basename="$1"
-  local reference_label="$2"
-  local fasta_extension
-  for fasta_extension in fa fasta fna fa.gz fasta.gz fna.gz; do
-    if [[ -f "${reference_basename}.${fasta_extension}" ]]; then
-      printf '%s\n' "${reference_basename}.${fasta_extension}"
-      return 0
-    fi
-  done
-  echo "ERROR: No $reference_label reference FASTA found; expected ${reference_basename}.{fa,fasta,fna}[.gz]." >&2
-  return 1
-}
+# Normalize all reference shards and annotation coordinate systems before mapping.
+reference_args=(--decoy-dir "$DECOY_REFERENCE_DIR" --bacteria-dir "$BACTERIA_REFERENCE_DIR"
+  --output-dir "$ALIGNMENT_DIR/references")
+if [[ "$HOST_ENABLED" == true ]]; then
+  reference_args+=(--host-dir "$HOST_REFERENCE_DIR")
+fi
+python3 "$SCRIPT_DIR/prepare_references.py" "${reference_args[@]}"
+# Read only fixed manifest fields; generated paths are never evaluated as shell code.
+mapfile -t reference_paths < <(python3 - "$ALIGNMENT_DIR/references/manifest.json" <<'MANIFEST'
+import json, sys
+from pathlib import Path
+manifest = json.loads(Path(sys.argv[1]).read_text())
+print(manifest["decoy"]["fasta"])
+for organism in ("bacteria", "host"):
+    entry = manifest.get(organism) or {}
+    for molecule in ("dna", "rna"):
+        reference = entry.get(molecule) or {}
+        for key in ("fasta", "gff"):
+            print(reference.get(key, ""))
+MANIFEST
+)
+DECOY_FASTA="${reference_paths[0]}"
+BACTERIA_DNA_FASTA="${reference_paths[1]}"; BACTERIA_DNA_GFF="${reference_paths[2]}"
+BACTERIA_RNA_FASTA="${reference_paths[3]}"; BACTERIA_RNA_GFF="${reference_paths[4]}"
+HOST_DNA_FASTA="${reference_paths[5]}"; HOST_DNA_GFF="${reference_paths[6]}"
+HOST_RNA_FASTA="${reference_paths[7]}"; HOST_RNA_GFF="${reference_paths[8]}"
+BACTERIA_GFF="$ALIGNMENT_DIR/references/bacteria.combined.gff3"
+HOST_GFF=""
+BACTERIA_GENE_ATTRIBUTE=gene_id
+HOST_GENE_ATTRIBUTE=gene_id
+cat -- "$BACTERIA_DNA_GFF" > "$BACTERIA_GFF"
+if [[ -n "$BACTERIA_RNA_GFF" ]]; then cat -- "$BACTERIA_RNA_GFF" >> "$BACTERIA_GFF"; fi
+if [[ "$HOST_ENABLED" == true ]]; then
+  HOST_GFF="$ALIGNMENT_DIR/references/host.combined.gff3"
+  cat -- "$HOST_DNA_GFF" > "$HOST_GFF"
+  if [[ -n "$HOST_RNA_GFF" ]]; then cat -- "$HOST_RNA_GFF" >> "$HOST_GFF"; fi
+fi
 
 # Each stage, k value, and reference content uses an isolated index. BBSplit's
 # own reference-name cache would otherwise reuse stale sequence after an edit.
@@ -153,9 +118,8 @@ run_bbsplit() {
 }
 
 prepare_bbsplit_index() {
-  local reference_basename="$1" stage="$2"
-  local fasta_file fingerprint index_dir
-  fasta_file=$(find_reference_fasta "$reference_basename" "$stage") || return 1
+  local fasta_file="$1" stage="$2"
+  local fingerprint index_dir
   fingerprint=$(sha256sum "$fasta_file") || return 1
   fingerprint=${fingerprint%% *}
   index_dir="$ALIGNMENT_DIR/indexes/$stage/k$BBSPLIT_K/$fingerprint"
@@ -172,10 +136,17 @@ prepare_bbsplit_index() {
   printf '%s\n' "$index_dir"
 }
 
-DECOY_BBSPLIT_INDEX=$(prepare_bbsplit_index "$DECOY_BBSPLIT_REFERENCE" "decoy")
-BACTERIA_BBSPLIT_INDEX=$(prepare_bbsplit_index "$BACTERIA_BBSPLIT_REFERENCE" "bacteria")
-if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
-  HOST_BBSPLIT_INDEX=$(prepare_bbsplit_index "$HOST_BBSPLIT_REFERENCE" "host")
+DECOY_BBSPLIT_INDEX=$(prepare_bbsplit_index "$DECOY_FASTA" "decoy")
+BACTERIA_DNA_INDEX=$(prepare_bbsplit_index "$BACTERIA_DNA_FASTA" "bacteria")
+BACTERIA_RNA_INDEX=""; HOST_RNA_INDEX=""
+if [[ -n "$BACTERIA_RNA_FASTA" ]]; then
+  BACTERIA_RNA_INDEX=$(prepare_bbsplit_index "$BACTERIA_RNA_FASTA" "bacteria_rna")
+fi
+if [[ "$HOST_ENABLED" == true ]]; then
+  HOST_DNA_INDEX=$(prepare_bbsplit_index "$HOST_DNA_FASTA" "host")
+  if [[ -n "$HOST_RNA_FASTA" ]]; then
+    HOST_RNA_INDEX=$(prepare_bbsplit_index "$HOST_RNA_FASTA" "host_rna")
+  fi
 fi
 
 matched_fastqs=("$FASTQ_DIR"/$FASTQ_GLOB)
@@ -303,62 +274,95 @@ for idx in "${!trimmed_fastqs[@]}"; do
   decoy_unmapped_fastqs+=("$unmapped")
 done
 
-# Map decoy-unmapped reads to the target bacterium.
-host_input_fastqs=()
+# Keep all RNA mapping ahead of DNA, including RNA from the other organism.
+# Every stage receives only primary-unmapped reads from the previous stage.
+BACTERIA_sam_filenames=(); HOST_sam_filenames=()
 for idx in "${!decoy_unmapped_fastqs[@]}"; do
-  i="${decoy_unmapped_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-  echo "mapping to the bacterial reference with BBSplit: $i_basename ..."
-  host_input="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria.fastq.gz"
-  bbsplit_stage "$BACTERIA_BBSPLIT_INDEX" \
-    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.sam" \
-    "$BACTERIA_ALIGNMENT_DIR/BACTERIA_${i_basename}.bbsplit.txt" \
-    "$host_input" "$i"
-  host_input_fastqs+=("$host_input")
+  current_input="${decoy_unmapped_fastqs[$idx]}"
+  i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
+  for stage in bacteria_rna host_rna bacteria_dna host_dna; do
+    case "$stage" in
+      bacteria_rna)
+        [[ -n "$BACTERIA_RNA_INDEX" ]] || continue
+        index="$BACTERIA_RNA_INDEX"; organism=bacteria; molecule=rna; prefix=BACTERIA ;;
+      host_rna)
+        [[ -n "$HOST_RNA_INDEX" ]] || continue
+        index="$HOST_RNA_INDEX"; organism=host; molecule=rna; prefix=HOST ;;
+      bacteria_dna)
+        index="$BACTERIA_DNA_INDEX"; organism=bacteria; molecule=dna; prefix=BACTERIA ;;
+      host_dna)
+        [[ "$HOST_ENABLED" == true ]] || continue
+        index="$HOST_DNA_INDEX"; organism=host; molecule=dna; prefix=HOST ;;
+    esac
+    stage_dir="$ALIGNMENT_DIR/$organism/$molecule"
+    mkdir -p "$stage_dir"
+    unmapped="$stage_dir/${i_basename}_unmapped.fastq.gz"
+    echo "mapping to $organism $molecule references with BBSplit: $i_basename ..."
+    bbsplit_stage "$index" "$stage_dir/${prefix}_${i_basename}.sam" \
+      "$stage_dir/${prefix}_${i_basename}.bbsplit.txt" "$unmapped" "$current_input"
+    current_input="$unmapped"
+  done
+  cp -- "$current_input" "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz"
+  finalize_args=(--alignment-dir "$ALIGNMENT_DIR" --sample-prefix "$i_basename")
+  if [[ "$HOST_ENABLED" == true ]]; then finalize_args+=(--host-enabled); fi
+  if [[ -n "$BACTERIA_RNA_INDEX" ]]; then finalize_args+=(--bacteria-rna); fi
+  if [[ -n "$HOST_RNA_INDEX" ]]; then finalize_args+=(--host-rna); fi
+  python3 "$SCRIPT_DIR/finalize_sample_alignments.py" "${finalize_args[@]}"
+  # This compatibility FASTQ contains reads assigned to neither decoy nor bacteria.
+  # Include host RNA reads removed before the bacterial DNA stage.
+  bacterial_unmapped="$BACTERIA_ALIGNMENT_DIR/${i_basename}_unmapped_to_bacteria.fastq.gz"
+  if [[ -n "$HOST_RNA_INDEX" ]]; then
+    samtools fastq -@ "$THREADS" -F 2308 -0 "$BACTERIA_ALIGNMENT_DIR/.${i_basename}_host_rna.fastq.gz" \
+      -s /dev/null -n "$HOST_ALIGNMENT_DIR/rna/HOST_${i_basename}.sam"
+    cat -- "$BACTERIA_ALIGNMENT_DIR/.${i_basename}_host_rna.fastq.gz" \
+      "$BACTERIA_ALIGNMENT_DIR/dna/${i_basename}_unmapped.fastq.gz" > "$bacterial_unmapped"
+    rm -- "$BACTERIA_ALIGNMENT_DIR/.${i_basename}_host_rna.fastq.gz"
+  else
+    cp -- "$BACTERIA_ALIGNMENT_DIR/dna/${i_basename}_unmapped.fastq.gz" "$bacterial_unmapped"
+  fi
+  for organism in bacteria host; do
+    if [[ "$organism" == host && "$HOST_ENABLED" != true ]]; then continue; fi
+    if [[ "$organism" == bacteria ]]; then
+      prefix=BACTERIA; dna_gff="$BACTERIA_DNA_GFF"; rna_gff="$BACTERIA_RNA_GFF"
+      BACTERIA_sam_filenames+=("$BACTERIA_ALIGNMENT_DIR/${prefix}_${i_basename}.sam")
+    else
+      prefix=HOST; dna_gff="$HOST_DNA_GFF"; rna_gff="$HOST_RNA_GFF"
+      HOST_sam_filenames+=("$HOST_ALIGNMENT_DIR/${prefix}_${i_basename}.sam")
+    fi
+    organism_dir="$ALIGNMENT_DIR/$organism"
+    category_args=(--dna-sam "$organism_dir/dna/${prefix}_${i_basename}.sam" --dna-gff "$dna_gff"
+      --output "$organism_dir/${prefix}_${i_basename}.categories.tsv")
+    if [[ -n "$rna_gff" ]]; then
+      category_args+=(--rna-sam "$organism_dir/rna/${prefix}_${i_basename}.sam" --rna-gff "$rna_gff")
+    fi
+    python3 "$SCRIPT_DIR/classify_alignments.py" "${category_args[@]}"
+  done
 done
-
-BACTERIA_sam_filenames=("$BACTERIA_ALIGNMENT_DIR"/BACTERIA*.sam)
-
-# Save the reads left after all configured classification stages under one
-# stable name. With no host reference, the bacterial-unmapped reads are already
-# the final leftovers; otherwise, write the host-unmapped reads there directly.
-if [[ -n "$HOST_BBSPLIT_REFERENCE" ]]; then
-  for idx in "${!host_input_fastqs[@]}"; do
-    i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-    echo "mapping to the host reference with BBSplit: $i_basename ..."
-    bbsplit_stage "$HOST_BBSPLIT_INDEX" \
-      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.sam" \
-      "$HOST_ALIGNMENT_DIR/HOST_${i_basename}.bbsplit.txt" \
-      "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz" "$i"
-  done
-else
-  for idx in "${!host_input_fastqs[@]}"; do
-    i="${host_input_fastqs[$idx]}"; i_basename="${sample_names[$idx]}_${MIN_READ_LENGTH}bp"
-    cp -- "$i" "$LEFTOVER_READS_DIR/${i_basename}_leftover.fastq.gz"
-  done
-fi
 
 # Create featureCounts summary file.
 # Assign mapped reads to bacterial genes, retaining the pipeline's stranded and
 # overlapping-feature behavior.
-featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -O -s 1 -g "$BACTERIA_GENE_ATTRIBUTE" -t CDS \
-  -o "$OUTPUT_DIR/featurecounts_BACTERIA_summary.txt" "${BACTERIA_sam_filenames[@]}"
+python3 "$SCRIPT_DIR/count_features.py" --threads "$THREADS" --annotation "$BACTERIA_GFF" \
+  --allow-overlap --gene-id "$BACTERIA_GENE_ATTRIBUTE" --feature-type CDS \
+  --output "$OUTPUT_DIR/featurecounts_BACTERIA_summary.txt" "${BACTERIA_sam_filenames[@]}"
 sed 's/\t/,/g' "$OUTPUT_DIR/featurecounts_BACTERIA_summary.txt" > "$OUTPUT_DIR/featurecounts_BACTERIA_summary.csv"
-# Count alignments assigned to an rRNA annotation separately.  The generated
-# .summary file supplies the non-duplicated Assigned total used by the read
-# disposition CSV; all other bacterial alignments are reported as non-rRNA.
-featureCounts -T "$THREADS" -a "$BACTERIA_GFF" -s 1 -g "$BACTERIA_GENE_ATTRIBUTE" -t rRNA \
-  -o "$OUTPUT_DIR/featurecounts_BACTERIA_rRNA.txt" "${BACTERIA_sam_filenames[@]}"
+# Retain the independent rRNA featureCounts output for per-feature analysis.
+# Exclusive read categories for the breakdown come from classify_alignments.py.
+python3 "$SCRIPT_DIR/count_features.py" --threads "$THREADS" --annotation "$BACTERIA_GFF" \
+  --gene-id "$BACTERIA_GENE_ATTRIBUTE" --feature-type rRNA \
+  --output "$OUTPUT_DIR/featurecounts_BACTERIA_rRNA.txt" "${BACTERIA_sam_filenames[@]}"
 
 # When a host reference is configured, independently assign host alignments to
 # its CDS features and keep the results alongside the host BBSplit outputs.
 if [[ -n "$HOST_GFF" ]]; then
-  HOST_sam_filenames=("$HOST_ALIGNMENT_DIR"/HOST_*.sam)
-  featureCounts -T "$THREADS" -a "$HOST_GFF" -O -s 1 -g "$HOST_GENE_ATTRIBUTE" -t CDS \
-    -o "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.txt" "${HOST_sam_filenames[@]}"
+  python3 "$SCRIPT_DIR/count_features.py" --threads "$THREADS" --annotation "$HOST_GFF" \
+    --allow-overlap --gene-id "$HOST_GENE_ATTRIBUTE" --feature-type CDS \
+    --output "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.txt" "${HOST_sam_filenames[@]}"
   sed 's/\t/,/g' "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.txt" \
     > "$HOST_ALIGNMENT_DIR/featurecounts_HOST_summary.csv"
-  featureCounts -T "$THREADS" -a "$HOST_GFF" -s 1 -g "$HOST_GENE_ATTRIBUTE" -t rRNA \
-    -o "$HOST_ALIGNMENT_DIR/featurecounts_HOST_rRNA.txt" "${HOST_sam_filenames[@]}"
+  python3 "$SCRIPT_DIR/count_features.py" --threads "$THREADS" --annotation "$HOST_GFF" \
+    --gene-id "$HOST_GENE_ATTRIBUTE" --feature-type rRNA \
+    --output "$HOST_ALIGNMENT_DIR/featurecounts_HOST_rRNA.txt" "${HOST_sam_filenames[@]}"
 fi
 
 # Calculate coverage with respect to the bacterial reference with samtools.
@@ -369,8 +373,11 @@ do
     samtools view -@ "$THREADS" -bS "$i" > "$BACTERIA_ALIGNMENT_DIR/${i_basename}.bam"
     samtools sort -@ "$THREADS" -o "$BACTERIA_ALIGNMENT_DIR/${i_basename}.sorted.bam" "$BACTERIA_ALIGNMENT_DIR/${i_basename}.bam"
     samtools index -@ "$THREADS" "$BACTERIA_ALIGNMENT_DIR/${i_basename}.sorted.bam"
-    samtools coverage -mA "$BACTERIA_ALIGNMENT_DIR/${i_basename}.sorted.bam"
-    samtools coverage -m -o "$BACTERIA_ALIGNMENT_DIR/${i_basename}_coverage.txt" "$BACTERIA_ALIGNMENT_DIR/${i_basename}.sorted.bam"
+    # Genome coverage describes DNA fallback alignments; RNA has transcript coordinates.
+    dna_bam="$BACTERIA_ALIGNMENT_DIR/dna/${i_basename}.sorted.bam"
+    samtools sort -@ "$THREADS" -o "$dna_bam" "$BACTERIA_ALIGNMENT_DIR/dna/${i_basename}.sam"
+    samtools coverage -mA "$dna_bam"
+    samtools coverage -m -o "$BACTERIA_ALIGNMENT_DIR/${i_basename}_coverage.txt" "$dna_bam"
     profile_args=(
       --bam "$BACTERIA_ALIGNMENT_DIR/${i_basename}.sorted.bam"
       --gff "$BACTERIA_GFF"
@@ -386,5 +393,5 @@ done
 (
   cd "$OUTPUT_DIR"
   python3 "$CSV_CONVERSION_SCRIPT"
-  python3 "$SCRIPT_DIR/read_breakdown_csv.py"
+  python3 "$SCRIPT_DIR/read_breakdown_csv.py" --host-enabled "$HOST_ENABLED"
 )

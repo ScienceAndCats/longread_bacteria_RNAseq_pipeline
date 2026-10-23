@@ -1,0 +1,61 @@
+{
+  "tag": "Cutadapt report",
+  "schema_version": [0, 3],
+  "cutadapt_version": "5.2",
+  "python_version": "3.13.15",
+  "command_line_arguments": [
+    "-j",
+    "1",
+    "-e",
+    "0.15",
+    "-O",
+    "12",
+    "-m",
+    "20",
+    "--json",
+    "/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/empty_20bp.cutadapt.json",
+    "-o",
+    "/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/.empty_20bp.adapter_trimmed.fastq",
+    "/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/.adapter_trim.HTCtyB/trim.fastq"
+  ],
+  "cores": 1,
+  "input": {
+    "path1": "/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/.adapter_trim.HTCtyB/trim.fastq",
+    "path2": null,
+    "paired": false
+  },
+  "read_counts": {
+    "input": 0,
+    "filtered": {
+      "too_short": 0,
+      "too_long": null,
+      "too_many_n": null,
+      "too_many_expected_errors": null,
+      "casava_filtered": null,
+      "discard_trimmed": null,
+      "discard_untrimmed": null
+    },
+    "output": 0,
+    "reverse_complemented": null,
+    "read1_with_adapter": null,
+    "read2_with_adapter": null
+  },
+  "basepair_counts": {
+    "input": 0,
+    "input_read1": 0,
+    "input_read2": null,
+    "quality_trimmed": null,
+    "quality_trimmed_read1": null,
+    "quality_trimmed_read2": null,
+    "poly_a_trimmed": null,
+    "poly_a_trimmed_read1": null,
+    "poly_a_trimmed_read2": null,
+    "output": 0,
+    "output_read1": 0,
+    "output_read2": null
+  },
+  "adapters_read1": [],
+  "adapters_read2": null,
+  "poly_a_trimmed_read1": null,
+  "poly_a_trimmed_read2": null
+}

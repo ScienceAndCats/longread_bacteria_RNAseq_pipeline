@@ -1,0 +1,5 @@
+metric	count
+input	1
+eligible	0
+oversized	1
+max_read_length	6000

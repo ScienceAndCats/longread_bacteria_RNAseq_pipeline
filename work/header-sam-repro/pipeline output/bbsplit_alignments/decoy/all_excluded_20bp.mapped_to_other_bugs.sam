@@ -1,0 +1,4 @@
+@HD	VN:1.4	SO:unsorted
+@SQ	SN:decoy_ref	LN:1200
+@PG	ID:BBTools	PN:BBMap	VN:39.79	CL:java -ea --add-modules=jdk.incubator.vector -Xmx1g -Xms1g align2.BBSplitter ow=t fastareadlen=500 minhits=1 minratio=0.56 maxindel=20 qtrim=rl untrim=t trimq=6 -Xmx1g path=/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/bbsplit_alignments/indexes/decoy/k9/6208927f8a8165b31b5dfcc173c4bfce507222b2110491cae86d96bf4a4452c1 build=1 in=/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/all_excluded_20bp.trim.fastq out=stdout.sam overwrite=t threads=1 k=9 mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 qtrim=f interleaved=f secondary=f ambiguous=best trimrefdescription=t
+@PG	ID:samtools	PN:samtools	PP:BBTools	VN:1.24	CL:samtools view -h -F 2304 -o /workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/bbsplit_alignments/decoy/all_excluded_20bp.mapped_to_other_bugs.sam -

@@ -16,11 +16,25 @@ ATTRIBUTES = (
     "Bacteria aligned",
     "Bacteria non-rRNA",
     "Bacteria rRNA",
+    "Bacteria CDS",
+    "Bacteria other RNA",
+    "Bacteria intergenic/unannotated",
     "Host aligned",
     "Host non-rRNA",
     "Host rRNA",
+    "Host CDS",
+    "Host other RNA",
+    "Host intergenic/unannotated",
     "Leftover reads",
 )
+
+CATEGORY_METRICS = ("aligned", "CDS", "rRNA", "other_RNA", "intergenic_unannotated")
+CATEGORY_LABELS = {
+    "CDS": "CDS",
+    "rRNA": "rRNA",
+    "other_RNA": "other RNA",
+    "intergenic_unannotated": "intergenic/unannotated",
+}
 
 
 def report_number(report, pattern, path):
@@ -80,6 +94,16 @@ def length_filter_counts(path):
     return metrics["input"], metrics["eligible"], metrics["oversized"]
 
 
+def category_counts(path, aligned):
+    """Read mutually exclusive primary-alignment categories, checking conservation."""
+    metrics = metric_counts(path, CATEGORY_METRICS)
+    if metrics["aligned"] != sum(metrics[key] for key in CATEGORY_LABELS):
+        raise ValueError(f"Read categories do not sum to aligned reads in {path}")
+    if metrics["aligned"] != aligned:
+        raise ValueError(f"Category aligned count differs from BBSplit aligned count in {path}")
+    return metrics
+
+
 def sample_from_log(path):
     match = re.fullmatch(r"(.+)_\d+bp\.cutadapt_log\.txt", path.name)
     if not match:
@@ -114,20 +138,24 @@ def percentage(count, total):
     return f"{count * 100 / total:.2f}%" if total else "0.00%"
 
 
-def build_table(output_dir):
+def build_table(output_dir, host_enabled=None):
     cutadapt_logs = sorted(output_dir.glob("*cutadapt_log.txt"), key=lambda p: p.name.casefold())
     if not cutadapt_logs:
         raise ValueError(f"No cutadapt logs found in {output_dir}")
 
-    bacteria_rrna_path = output_dir / "featurecounts_BACTERIA_rRNA.txt.summary"
-    bacteria_rrna = assigned_by_sample(bacteria_rrna_path, "BACTERIA")
-    host_rrna_path = output_dir / "bbsplit_alignments/host/featurecounts_HOST_rRNA.txt.summary"
-    host_enabled = host_rrna_path.exists()
-    host_rrna = assigned_by_sample(host_rrna_path, "HOST") if host_enabled else {}
+    if host_enabled is None:
+        host_dir = output_dir / "bbsplit_alignments/host"
+        host_enabled = any(host_dir.glob("HOST_*.categories.tsv")) or (
+            host_dir / "featurecounts_HOST_rRNA.txt.summary"
+        ).exists()
 
     rows = []
+    seen = set()
     for cutadapt_path in cutadapt_logs:
         sample = sample_from_log(cutadapt_path)
+        if sample in seen:
+            raise ValueError(f"Duplicate cutadapt sample: {sample}")
+        seen.add(sample)
         total, passing = cutadapt_counts(cutadapt_path)
         # Allow a configured minimum length other than the historical 22 bp default.
         length = re.search(r"_(\d+)bp\.cutadapt_log", cutadapt_path.name).group(1)
@@ -148,12 +176,6 @@ def build_table(output_dir):
         else:
             host_aligned = 0
 
-        if sample not in bacteria_rrna or (host_enabled and sample not in host_rrna):
-            raise ValueError(f"Missing rRNA featureCounts result for sample {sample}")
-        bacterial_rrna = bacteria_rrna[sample]
-        host_rrna_count = host_rrna[sample] if host_enabled else 0
-        if bacterial_rrna > bacteria_aligned or host_rrna_count > host_aligned:
-            raise ValueError(f"rRNA count exceeds aligned count for sample {sample}")
         counts = {
             "Total reads": total,
             "Reads passing cutadapt length filter": passing,
@@ -161,11 +183,7 @@ def build_table(output_dir):
             "Reads over 6000 bp (not processed)": oversized,
             "Decoy aligned": decoy_aligned,
             "Bacteria aligned": bacteria_aligned,
-            "Bacteria non-rRNA": bacteria_aligned - bacterial_rrna,
-            "Bacteria rRNA": bacterial_rrna,
             "Host aligned": host_aligned,
-            "Host non-rRNA": host_aligned - host_rrna_count,
-            "Host rRNA": host_rrna_count,
             "Leftover reads": eligible - decoy_aligned - bacteria_aligned - host_aligned,
         }
         sources = {
@@ -175,12 +193,24 @@ def build_table(output_dir):
             "Reads over 6000 bp (not processed)": f"{length_path.name}: oversized",
             "Decoy aligned": f"{decoy_path.relative_to(output_dir)}: pipeline primary-alignment count",
             "Bacteria aligned": f"{bacteria_path.relative_to(output_dir)}: pipeline primary-alignment count",
-            "Bacteria rRNA": f"{bacteria_rrna_path.relative_to(output_dir)}: Assigned",
             "Host aligned": (f"{host_path.relative_to(output_dir)}: pipeline primary-alignment count" if host_enabled else "Host alignment not configured"),
-            "Host rRNA": (f"{host_rrna_path.relative_to(output_dir)}: Assigned" if host_enabled else "Host alignment not configured"),
         }
-        sources["Bacteria non-rRNA"] = "Calculated: Bacteria aligned minus Bacteria rRNA"
-        sources["Host non-rRNA"] = "Calculated: Host aligned minus Host rRNA"
+        for label, prefix, enabled, aligned in (
+            ("Bacteria", "BACTERIA", True, bacteria_aligned),
+            ("Host", "HOST", host_enabled, host_aligned),
+        ):
+            category_path = output_dir / (
+                f"bbsplit_alignments/{label.lower()}/{prefix}_{sample}_{length}bp.categories.tsv"
+            )
+            metrics = category_counts(category_path, aligned) if enabled else dict.fromkeys(CATEGORY_METRICS, 0)
+            for key, attribute in CATEGORY_LABELS.items():
+                counts[f"{label} {attribute}"] = metrics[key]
+                sources[f"{label} {attribute}"] = (
+                    f"{category_path.relative_to(output_dir)}: {key} (exclusive primary-alignment category)"
+                    if enabled else "Host alignment not configured"
+                )
+            counts[f"{label} non-rRNA"] = aligned - metrics["rRNA"]
+            sources[f"{label} non-rRNA"] = f"Calculated: {label} aligned minus {label} rRNA"
         sources["Leftover reads"] = "Calculated: eligible reads minus decoy, bacteria, and host aligned"
         rows.append((sample, counts, sources))
     return rows
@@ -190,8 +220,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--host-enabled", choices=("true", "false"), default=None,
+                        help="Explicit run configuration; overrides detection of existing host reports.")
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
+    host_enabled = None if args.host_enabled is None else args.host_enabled == "true"
+    rows = build_table(output_dir, host_enabled=host_enabled)
     destination = args.output or output_dir / f"BACTERIA_{output_dir.name}_read_breakdown.csv"
     header = ["Sample"]
     for attribute in ATTRIBUTES:
@@ -199,7 +233,7 @@ def main():
     with destination.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(header)
-        for sample, counts, sources in build_table(output_dir):
+        for sample, counts, sources in rows:
             row = [sample]
             for attribute in ATTRIBUTES:
                 row.extend((counts[attribute], percentage(counts[attribute], counts["Total reads"]), sources[attribute]))
