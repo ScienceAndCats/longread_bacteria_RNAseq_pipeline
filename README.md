@@ -53,7 +53,12 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `FASTQ_GLOB` | Shell glob for FASTQ inputs, such as `*.fastq`. |
 | `SLURM_MAX_SAMPLES` | Maximum samples accepted per submission (default: `40`); larger input folders produce an error until this limit is increased. |
 | `SLURM_MAX_CONCURRENT` | Maximum sample array tasks running at once (default: `8`). |
-| `SLURM_ACCOUNT` | Optional account override for the Slurm template. |
+| `SLURM_ACCOUNT` | Required PACE allocation/account for every submitted job. |
+| `SLURM_MAIL_USER` | Your notification email address; leave empty to disable job emails. |
+| `SLURM_MAIL_TYPE` | Slurm notification events (default: `END,FAIL`); used when an email address is set. |
+| `CONDA_SH` | Path to your conda installation's `etc/profile.d/conda.sh`. |
+| `CONDA_ENV` | Conda environment name or path to activate on compute nodes (default: `bacteria-RNAseq-pipeline`). |
+| `PIPELINE_SKIP_CONDA` | Set `true` only when your site's job setup already activates the required environment (default: `false`). |
 | `OUTPUT_DIR` | Directory where output files should be written. |
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
 | `SAMPLE_SIZE` | Maximum reads sampled from each FASTQ (default: `5000`). |
@@ -167,17 +172,14 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 ### Submit sample jobs on Slurm
 
 The included `run_bacteria_pipeline.sbatch` follows the example Slurm template:
-one node, one task, 16 CPUs, 64 GB RAM, and a four-hour time limit. Fill in its
-`YOUR_ACCOUNT` placeholder, or set `SLURM_ACCOUNT` in the config. Fill in the
-conda installation path (`YOUR_USERNAME`), or export `CONDA_SH` pointing to your
-installation's `etc/profile.d/conda.sh`. The email address is optional and
-commented out. No personal account or username is included in the template.
-If your site's modules already activate the required environment, export
-`PIPELINE_SKIP_CONDA=true` instead. The submission helper uses Python 3 on the
-login node; the jobs activate `bacteria-RNAseq-pipeline` on their compute nodes.
+one node, one task, 16 CPUs, 64 GB RAM, and a four-hour time limit. Set your
+conda path, environment, PACE account, and notification email in `config.env`.
+The submission helper passes account/email settings to Slurm for every job;
+compute jobs source the saved configuration before activating conda. No edits
+to the sbatch file or environment-variable exports are required for these settings.
+The helper uses Python 3 on the login node before the compute jobs activate conda.
 
-Keep the input/reference/output folders in `config.env`. The main Slurm settings
-are:
+Keep the input/reference/output folders and cluster settings in `config.env`:
 
 ```bash
 FASTQ_DIR="/path/to/reads"
@@ -185,7 +187,19 @@ FASTQ_GLOB="*.fastq*"
 OUTPUT_DIR="/path/to/results"
 SLURM_MAX_SAMPLES="40"
 SLURM_MAX_CONCURRENT="8"
+SLURM_ACCOUNT="YOUR_PACE_ACCOUNT"
+SLURM_MAIL_USER="YOUR_USERNAME@example.edu"
+SLURM_MAIL_TYPE="END,FAIL"
+CONDA_SH="/path/to/YOUR_USERNAME/miniforge3/etc/profile.d/conda.sh"
+CONDA_ENV="bacteria-RNAseq-pipeline"
+PIPELINE_SKIP_CONDA="false"
 ```
+
+Leave `SLURM_MAIL_USER` empty to disable emails. If your site's module/job setup
+already activates the environment, set `PIPELINE_SKIP_CONDA="true"` in the config.
+Otherwise, the helper checks the conda script path and environment setting before
+submitting any jobs. The saved configuration also fixes these settings for queued
+jobs if you later edit your project config.
 
 Submit from your Slurm login node:
 
