@@ -20,7 +20,8 @@ from sample_manifest import check_inputs, discover_samples, stage_sample
 REPOSITORY = Path(__file__).resolve().parent
 CONFIG_KEYS = (
     "FASTQ_DIR", "FASTQ_GLOB", "OUTPUT_DIR", "SLURM_MAX_SAMPLES",
-    "SLURM_MAX_CONCURRENT", "SLURM_ACCOUNT", "SAMPLE_READS", "SAMPLE_SIZE", "SAMPLE_SEED",
+    "SLURM_MAX_CONCURRENT", "SLURM_ACCOUNT", "SLURM_MAIL_USER", "SLURM_MAIL_TYPE",
+    "CONDA_SH", "CONDA_ENV", "PIPELINE_SKIP_CONDA", "SAMPLE_READS", "SAMPLE_SIZE", "SAMPLE_SEED",
     "DECOY_REFERENCE_DIR", "BACTERIA_REFERENCE_DIR", "HOST_REFERENCE_DIR",
     "DECOY_BBSPLIT_REFERENCE", "BACTERIA_BBSPLIT_REFERENCE", "HOST_BBSPLIT_REFERENCE",
     "BBSPLIT_K", "ADAPTER_SEQUENCES", "ADAPTER_REVERSE_COMPLEMENTS", "ADAPTER_MAX_TRIMMING_ROUNDS",
@@ -64,12 +65,34 @@ def read_config(path):
     converter = Path(config.get("CSV_CONVERSION_SCRIPT", "bacteria_with_decoys_csvConversion.py"))
     config["CSV_CONVERSION_SCRIPT"] = str(converter if converter.is_absolute() else REPOSITORY / converter)
     config.setdefault("FASTQ_GLOB", "*.fastq*")
+    config.setdefault("CONDA_SH", "")
+    config.setdefault("CONDA_ENV", "bacteria-RNAseq-pipeline")
+    config.setdefault("PIPELINE_SKIP_CONDA", "false")
+    config.setdefault("SLURM_MAIL_USER", "")
+    config.setdefault("SLURM_MAIL_TYPE", "END,FAIL")
+    config["PIPELINE_SKIP_CONDA"] = config["PIPELINE_SKIP_CONDA"].lower()
+    if config["PIPELINE_SKIP_CONDA"] not in {"true", "false"}:
+        raise ValueError("PIPELINE_SKIP_CONDA must be true or false")
+    if config["CONDA_SH"]:
+        config["CONDA_SH"] = str(Path(config["CONDA_SH"]).expanduser().resolve())
     if config.get("SAMPLE_READS", "false").lower() not in {"true", "false"}:
         raise ValueError("SAMPLE_READS must be true or false")
     for label in ("DECOY", "BACTERIA"):
         if not config.get(f"{label}_REFERENCE_DIR", config.get(f"{label}_BBSPLIT_REFERENCE", "")):
             raise ValueError(f"Set {label}_REFERENCE_DIR in {path}")
     return config
+
+
+def validate_job_settings(config):
+    if not config.get("SLURM_ACCOUNT", "").strip():
+        raise ValueError("Set SLURM_ACCOUNT to your PACE account in the config file")
+    if config["PIPELINE_SKIP_CONDA"] != "true":
+        if not config["CONDA_SH"] or not Path(config["CONDA_SH"]).is_file():
+            raise ValueError("Set CONDA_SH to your conda.sh file in the config file")
+        if not config["CONDA_ENV"].strip():
+            raise ValueError("Set CONDA_ENV to your conda environment name or path in the config file")
+    if config["SLURM_MAIL_USER"] and not config["SLURM_MAIL_TYPE"].strip():
+        raise ValueError("Set SLURM_MAIL_TYPE in the config file, or leave SLURM_MAIL_USER empty to disable emails")
 
 
 def write_config(path, config, **overrides):
@@ -88,6 +111,7 @@ def load_manifest(path):
 
 def submit(config_path, sbatch_script):
     config = read_config(config_path)
+    validate_job_settings(config)
     maximum = positive(config, "SLURM_MAX_SAMPLES", 40)
     concurrent = positive(config, "SLURM_MAX_CONCURRENT", 8)
     threads = positive(config, "THREADS", 16)
@@ -96,8 +120,6 @@ def submit(config_path, sbatch_script):
     if len(samples) > maximum:
         raise ValueError(f"Found {len(samples)} samples, exceeding SLURM_MAX_SAMPLES={maximum}; increase the setting to process all of them")
     script = Path(sbatch_script).expanduser().resolve(strict=True)
-    if not config.get("SLURM_ACCOUNT") and re.search(r"^#SBATCH\s+--account=YOUR_ACCOUNT\s*$", script.read_text(), re.MULTILINE):
-        raise ValueError("Fill in --account in run_bacteria_pipeline.sbatch or set SLURM_ACCOUNT in the config")
     if not shutil.which("sbatch"):
         raise ValueError("sbatch is not available; submit from your Slurm login node")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -113,9 +135,12 @@ def submit(config_path, sbatch_script):
 
     def schedule(role, *options):
         command = ["sbatch", "--parsable", f"--chdir={REPOSITORY}", f"--job-name=bacteria_{role}",
-                   f"--output={root / 'logs' / (role + '-%A_%a.out')}", f"--cpus-per-task={threads}"]
-        if config.get("SLURM_ACCOUNT"):
-            command.append(f"--account={config['SLURM_ACCOUNT']}")
+                   f"--output={root / 'logs' / (role + '-%A_%a.out')}", f"--cpus-per-task={threads}",
+                   f"--account={config['SLURM_ACCOUNT']}"]
+        if config["SLURM_MAIL_USER"]:
+            command.extend((f"--mail-user={config['SLURM_MAIL_USER']}", f"--mail-type={config['SLURM_MAIL_TYPE']}"))
+        else:
+            command.append("--mail-type=NONE")
         command.extend(options)
         command.extend((str(script), role, str(manifest_path), str(REPOSITORY)))
         result = subprocess.run(command, cwd=REPOSITORY, check=True, text=True, capture_output=True)
