@@ -1,0 +1,7 @@
+test_absent_feature_type_writes_zero_matrix_and_balanced_summary (test_count_features.CountFeaturesTests.test_absent_feature_type_writes_zero_matrix_and_balanced_summary) ... ok
+test_independent_samples_preserve_empty_and_nonzero_columns (test_count_features.CountFeaturesTests.test_independent_samples_preserve_empty_and_nonzero_columns) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.091s
+
+OK

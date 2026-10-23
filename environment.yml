@@ -10,4 +10,5 @@ dependencies:
   - samtools=1.24
   - subread=2.1.1 # provides featureCounts
   - pysam
+  - biopython # reads GBFF annotations, including host RNA shards
   - matplotlib

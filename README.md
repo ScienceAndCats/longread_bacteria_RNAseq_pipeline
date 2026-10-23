@@ -1,6 +1,6 @@
 # Whiteley Bacteria Mapping Pipeline
 
-This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, separates reads over 6000 bp after trimming, uses BBSplit to remove reads that map to a decoy/pangenome reference and map the remaining eligible reads to a configurable bacterial reference genome, counts gene-level alignments, calculates bacterial coverage metrics, and writes project-level CSV summaries.
+This repository contains a long-read FASTQ processing pipeline for bacterial sequencing runs, with Oxford Nanopore as the default platform. The pipeline trims a configurable long-read adapter, separates reads over 6000 bp after trimming, uses BBSplit to remove reads that map to a decoy/pangenome reference, then maps remaining reads to bacterial and optional host RNA references before genomic DNA references. It discovers references and annotations from folders, counts gene-level alignments, calculates bacterial coverage metrics, and reports the read counts and percentages in CDS, rRNA, other RNA, and intergenic/unannotated regions.
 
 ## What the program does
 
@@ -9,14 +9,14 @@ This repository contains a long-read FASTQ processing pipeline for bacterial seq
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
 2. Uses Cutadapt to trim adapters in the configured `legacy` or `neb_e7330` mode, then applies the minimum read length. NEB mode extracts both flanks in either orientation and cleans repeated terminal adapters. Reads lacking adapters or having only one confirmed flank are retained if they pass the final length filter. After all trimming, reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
 3. Uses `bbsplit.sh` to map eligible trimmed reads to a decoy/pangenome reference and keeps reads that do **not** map to the decoys.
-4. Uses BBSplit again to map decoy-unmapped reads to the bacterial reference, retaining the reads that also fail this second alignment. When `HOST_BBSPLIT_REFERENCE` is set, only those reads that mapped to neither the decoy nor the bacterium are mapped to the host reference. It saves a final leftover FASTQ containing reads that failed every configured alignment stage, whether or not host mapping is enabled. Every stage uses configurable `k` (default `11`) and fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000`, with `qtrim=f` to preserve the adapter-trimmed sequences and `interleaved=f` for single-read FASTQ input.
-5. Uses `featureCounts` from Subread to assign aligned reads to CDS features in the bacterial GFF annotation sharing the reference basename and, when host mapping is enabled, independently counts host alignments against the matching host annotation.
-6. Uses `samtools` to create, sort, index, and calculate coverage from BAM files.
-7. Uses `gene_position_profile.py` on each sorted bacterial BAM to calculate strand-aware, normalized feature-position and aggregate metagene profiles.
+4. Maps decoy-unmapped reads in this order: **bacterial RNA → host RNA (if enabled) → bacterial DNA → host DNA (if enabled)**. Only primary-unmapped reads advance to the next stage, so an RNA match takes priority over a later genomic DNA match. RNA stages without reference files are skipped. A final leftover FASTQ contains reads that failed every configured alignment stage. Every stage uses configurable `k` (default `11`) and fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000`, with `qtrim=f` to preserve adapter-trimmed sequences and `interleaved=f` for single-read FASTQ input.
+5. Combines the RNA and DNA alignments for each organism, assigns each mapped read to one exclusive category for the breakdown CSV, and uses `featureCounts` from Subread to count CDS features against the discovered, normalized bacterial and host annotations.
+6. Uses `samtools` to create, sort, and index combined bacterial BAM files. Genomic coverage is calculated separately from the DNA-stage alignments only, so transcript coordinates do not inflate the genomic reference length.
+7. Uses `gene_position_profile.py` on each sorted combined bacterial BAM to calculate strand-aware, normalized feature-position and aggregate metagene profiles against the combined RNA/DNA annotation.
 8. Runs `bacteria_with_decoys_csvConversion.py` to combine cutadapt, length-partition, BBSplit, coverage, and featureCounts outputs into `BACTERIA_<project-directory>.csv`.
 9. Writes `BACTERIA_<project-directory>_read_breakdown.csv`, with one sample per row and read counts, percentages of total reads, and the source of every value.
 
-The summary conversion scripts use only the Python standard library. Positional profiling uses pysam and matplotlib.
+The summary conversion scripts use only the Python standard library. Reference preparation uses Biopython for GenBank annotations, read classification uses pysam, and positional profiling uses pysam and matplotlib.
 
 ## Dependencies
 
@@ -29,6 +29,7 @@ The pipeline environment includes these tools:
 - Subread / featureCounts 2.1.1
 - pysam
 - matplotlib
+- biopython (reads `.gbff`/GenBank annotations)
 
 A conda environment file is provided in `environment.yml`.
 The shell pipeline also requires `sha256sum` (GNU coreutils) to identify reference files for its index cache.
@@ -54,9 +55,9 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `SAMPLE_READS` | Set to `true` to analyze a random subset of each input, or `false` to analyze every read. |
 | `SAMPLE_SIZE` | Maximum reads sampled from each FASTQ (default: `5000`). |
 | `SAMPLE_SEED` | Seed used to make random sampling reproducible. |
-| `DECOY_BBSPLIT_REFERENCE` | FASTA basename for the decoy/pangenome reference. |
-| `BACTERIA_BBSPLIT_REFERENCE` | Shared basename for the bacterial FASTA and GFF annotation. |
-| `HOST_BBSPLIT_REFERENCE` | Optional shared basename for the host FASTA and GFF annotation; leave empty to disable host mapping and counting. |
+| `DECOY_REFERENCE_DIR` | Folder containing the decoy/pangenome FASTA files. |
+| `BACTERIA_REFERENCE_DIR` | Folder containing bacterial genomic DNA, CDS/RNA FASTA files, and their annotations, such as `PAO1`. |
+| `HOST_REFERENCE_DIR` | Optional host folder containing DNA and RNA references, including nested folders and RNA shards; leave empty to disable host mapping and counting. |
 | `BBSPLIT_K` | BBSplit k-mer length: integer `1`–`15` (default: `11`). All stages use fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 qtrim=f interleaved=f`. |
 | `ADAPTER_TRIMMING_MODE` | `legacy` (default) or `neb_e7330` for NEBNext E7330S Illumina libraries sequenced with Nanopore. |
 | `CUTADAPT_ERROR_RATE` | Maximum adapter alignment error rate (default: `0.15`); mismatches and indels are allowed. |
@@ -81,9 +82,28 @@ Edit `config.env` before running the pipeline. The key settings are:
 
 Set `SAMPLE_READS="true"` in `config.env` for a quick exploratory run. Before trimming or mapping, the pipeline uses reservoir sampling to select up to `SAMPLE_SIZE` complete long-read records from each input. Files with 5,000 reads or fewer are used in full with the default setting. The temporary sampled inputs are written under `OUTPUT_DIR/.bacteria_sampled_fastq`; original FASTQ files are never modified. Sampling is reproducible for the same input paths and `SAMPLE_SEED`. Set `SAMPLE_READS="false"` for a full analysis.
 
-The BBSplit reference settings are FASTA basenames. For example, configure `/refs/bacteria_reference` and supply `/refs/bacteria_reference.fa`, `.fasta`, or `.fna` (optionally gzip-compressed). BBSplit indexes are cached under `OUTPUT_DIR/bbsplit_alignments/indexes/<stage>/k<BBSPLIT_K>/<reference-file-SHA256>`, where `<stage>` is `decoy`, `bacteria`, or `host`. The reference-file checksum and k-mer length separate indexes when a reference or `BBSPLIT_K` changes. Bacterial and host annotations are discovered from the same basename using `.gff*`. Exactly one matching annotation must exist. For feature counting, the pipeline uses the annotation's `locus` attribute, falling back to `locus_tag` and then `gene`.
+### Reference folders
 
-When updating an existing run configuration, use `DECOY_BBSPLIT_REFERENCE`, `BACTERIA_BBSPLIT_REFERENCE`, and optional `HOST_BBSPLIT_REFERENCE`, remove the previous alignment preset setting, and supply each reference FASTA. Add `BBSPLIT_K="11"` or your chosen valid k-mer length. Recreate or update the conda environment from `environment.yml` to install BBMap.
+Point each setting to a folder, without a filename or accession root. For the example reference tree:
+
+```bash
+DECOY_REFERENCE_DIR="/storage/home/hcoda1/2/hwilms3/r-mwhiteley3-0/referencegenomes/decoy"
+BACTERIA_REFERENCE_DIR="/storage/home/hcoda1/2/hwilms3/r-mwhiteley3-0/referencegenomes/PAO1"
+HOST_REFERENCE_DIR="/storage/home/hcoda1/2/hwilms3/r-mwhiteley3-0/referencegenomes/human"
+# Use the mouse folder instead for mouse samples, or "" to disable host mapping.
+```
+
+`prepare_references.py` searches these folders recursively. FASTA files may end in `.fa`, `.fasta`, or `.fna`, with or without `.gz`; annotations may be GFF/GFF3 or GenBank/GBFF, also plain or gzip-compressed. Existing Bowtie2 and minimap2 indexes are ignored because BBSplit builds its own indexes.
+
+- A flat bacterial folder can contain `*_genomic.fna.gz`, `*_genomic.gbff.gz` and/or `*_genomic.gff.gz`, `*_cds_from_genomic.fna.gz`, and `*_rna_from_genomic.fna.gz`.
+- A host folder can contain `human_DNA/` and `human_RNA/`, or the corresponding mouse folders. All RNA shards, such as `human.1.rna.fna.gz` through `human.15.rna.fna.gz` with their `.rna.gbff.gz` annotations, are collected; no single shard needs to be selected in the config.
+- Whole genomic FASTA files form the DNA reference. `cds_from_genomic` sequences form coding RNA references alongside `rna_from_genomic` sequences; they are excluded from the genomic DNA reference.
+
+Reference preparation writes combined FASTA files, normalized GFF annotations with a `gene_id` attribute, and `bbsplit_alignments/references/manifest.json`. RNA sequence IDs receive an `RNA__` prefix so transcript coordinates remain distinct from genomic coordinates in combined alignment files. Reference FASTA and annotation records must describe the same sequences and genome version.
+
+BBSplit indexes are cached under `OUTPUT_DIR/bbsplit_alignments/indexes/<stage>/k<BBSPLIT_K>/<reference-file-SHA256>`. Separate RNA and DNA stages, reference checksums, and the k-mer length prevent reuse of an index built from different sequences or parameters. Recreate or update the conda environment from `environment.yml` when upgrading an existing installation, including Biopython for GBFF support.
+
+Existing configurations using `DECOY_BBSPLIT_REFERENCE`, `BACTERIA_BBSPLIT_REFERENCE`, and optional `HOST_BBSPLIT_REFERENCE` basenames remain supported as a fallback. New configurations should use the folder settings above. A legacy basename with only a genomic FASTA and GFF runs without an RNA stage.
 
 The 6000-bp partition is applied after all adapter trimming and the minimum-length filter, so a read originally over 6000 bp can still be aligned if trimming brings it within range. Cutadapt logs and adapter statistics continue to report the minimum-length filter before this partition. The per-sample `*.length_filter.tsv` records the eligible and oversized counts separately; oversized reads are excluded from every alignment stage and from final leftover reads. Samples with no eligible reads still appear in both summary CSVs with zero alignment and coverage counts.
 
@@ -191,9 +211,9 @@ Length-partition and CSV regressions also cover the 6000/6001-bp boundary,
 gzip output, eligible/oversized counts, and read-count conservation.
 When the pipeline dependencies are installed, the suite also runs BBSplit
 through feature counting, coverage, and positional profiling with default and
-custom k values, host mapping enabled and disabled, and empty/all-excluded samples.
+custom k values, host mapping enabled and disabled, and empty/all-excluded samples. Folder-reference regressions also cover RNA shards, GenBank annotations, RNA-before-DNA routing, exclusive region counts, and percentages.
 
-To enable host mapping and feature counting, set `HOST_BBSPLIT_REFERENCE` to the shared host reference basename and provide its FASTA and matching `.gff*` annotation. Setting it to `""` skips host index preparation, alignment, and counting. Host input consists exclusively of eligible reads that did not align to either the decoy or bacterial reference.
+To enable host mapping and feature counting, set `HOST_REFERENCE_DIR` to the `human` or `mouse` folder. Setting it to `""` skips host reference preparation, alignment, and counting. Host RNA is searched after bacterial RNA but before bacterial DNA; host DNA is searched last.
 
 ## Run the pipeline
 
@@ -215,14 +235,16 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 - `*_<MIN_READ_LENGTH>bp.length_filter.tsv` — post-trimming partition counts: `input`, `eligible`, `oversized`, and `max_read_length`; input is the number passing the minimum-length filter and the maximum is fixed at `6000`.
 - `bbsplit_alignments/oversized_reads/*_<MIN_READ_LENGTH>bp_over_6000bp.fastq.gz` — reads longer than 6000 bp after all adapter trimming, saved without alignment or other downstream processing.
 - `bbsplit_alignments/decoy/` — decoy SAM files, BBSplit reports and diagnostic logs, and decoy-unmapped reads.
-- `bbsplit_alignments/bacteria/` — bacterial SAM/BAM files, BBSplit reports and diagnostic logs, and coverage reports.
-- `bbsplit_alignments/bacteria/*_unmapped_to_bacteria.fastq.gz` — reads that mapped to neither the decoy nor bacterial reference and are used as the optional host-alignment input.
+- `bbsplit_alignments/references/` — prepared RNA/DNA FASTA files, normalized annotations, and the reference manifest.
+- `bbsplit_alignments/bacteria/` — combined bacterial SAM/BAM files, aggregate BBSplit reports, category reports, and coverage reports.
+- `bbsplit_alignments/{bacteria,host}/{rna,dna}/` — separate molecular-stage alignments, reports, diagnostic logs, and unmapped FASTQ files.
 - `bbsplit_alignments/host/` — optional host SAM files, BBSplit reports and diagnostic logs, and host featureCounts results.
-- `*.bbsplit.txt` and `*.bbsplit.stderr.txt` in each alignment stage — stable TSV `input`/`aligned`/`unmapped` counts and raw BBSplit diagnostic logs, respectively.
+- `*.bbsplit.txt` and `*.bbsplit.stderr.txt` in each alignment stage — stable TSV `input`/`aligned`/`unmapped` counts and raw BBSplit diagnostic logs, respectively. RNA/DNA stage reports describe the actual sequential inputs. The combined organism reports summarize both molecular stages: bacterial logical input is the decoy-unmapped total, and host logical input subtracts all bacterial alignments.
+- `bbsplit_alignments/{bacteria,host}/*.categories.tsv` — exclusive `CDS`, `rRNA`, `other_RNA`, and `intergenic_unannotated` counts; their sum equals `aligned`.
 - `bbsplit_alignments/leftover_reads/*_leftover.fastq.gz` — final eligible reads that mapped to none of the configured decoy, bacterial, or host references. These files are always created; when host mapping is disabled, they contain the bacterial-unmapped reads. Oversized reads are excluded.
 - `featurecounts_BACTERIA_summary.txt` and `featurecounts_BACTERIA_summary.csv` — featureCounts results.
 - `bbsplit_alignments/host/featurecounts_HOST_summary.txt` and `.csv` — optional, separate host featureCounts results.
-- `bbsplit_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools coverage reports.
+- `bbsplit_alignments/bacteria/BACTERIA_*_coverage.txt` — samtools genomic coverage reports calculated from DNA-stage alignments only. Because RNA matches are removed first, these report coverage from fallback DNA reads; they do not project RNA alignments back onto the genome.
 - `bbsplit_alignments/bacteria/BACTERIA_*.feature_read_positions.csv` — unique per-read positions and explicitly flagged ambiguous overlaps.
 - `bbsplit_alignments/bacteria/BACTERIA_*.feature_position_bins.csv` — read counts and within-feature fractions for every feature and normalized bin.
 - `bbsplit_alignments/bacteria/BACTERIA_*.metagene_{CDS,non_CDS}_profile.csv` and `.png` — separate protein-coding and noncoding aggregate profiles.
@@ -230,7 +252,17 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 - `bbsplit_alignments/bacteria/BACTERIA_*.metagene_CDS_vs_non_CDS.png` — comparison of mean normalized profiles.
 - `bbsplit_alignments/bacteria/BACTERIA_*.feature_position_summary.csv` — examined, unique, ambiguous, outside-feature, contributing-feature, and non-CDS subtype counts.
 - `BACTERIA_<project-directory>.csv` — combined summary table, including eligible reads and reads excluded for exceeding 6000 bp after trimming.
-- `BACTERIA_<project-directory>_read_breakdown.csv` — per-sample read disposition, including eligible and oversized counts. Each attribute has a raw count, a percentage of total input reads, and a source column. Bacterial and host non-rRNA values are the corresponding aligned counts minus reads assigned to an `rRNA` feature. Leftover reads passed the minimum- and maximum-length filters but aligned to none of the decoy, bacterial, or host references.
+- `BACTERIA_<project-directory>_read_breakdown.csv` — per-sample read disposition, including eligible and oversized counts, and separate bacterial/host CDS, rRNA, other RNA, and intergenic/unannotated counts. Each attribute has a raw count, a percentage of total input reads, and a source column. Existing non-rRNA columns remain available as aligned minus rRNA. Leftover reads passed the minimum- and maximum-length filters but aligned to none of the configured references.
+
+### Read-region categories
+
+Each primary mapped read is counted once for its organism across the RNA and DNA stages. Classification uses strand-compatible overlap with aligned reference blocks; skipped CIGAR regions do not create a feature overlap. If multiple annotation classes overlap a read, precedence is **rRNA → CDS → other RNA → intergenic/unannotated**. The four exclusive category counts sum to the organism's aligned count. The existing non-rRNA count includes CDS, other RNA, and intergenic/unannotated reads and therefore should not be added to those counts.
+
+Other RNA includes annotated noncoding RNAs other than rRNA, such as tRNA, tmRNA, ncRNA, and small RNAs. An RNA transcript alignment outside its annotated CDS is also other RNA. A generic genomic `gene` or `mRNA` record alone does not make a genomic interval CDS or noncoding RNA: genomic reads with no matching CDS or RNA feature, including intronic or UTR sequence without an explicit qualifying feature, fall in intergenic/unannotated.
+
+For genomic noncoding RNA transcripts with annotated exon children, only their exons contribute RNA overlaps; their intervening introns remain intergenic/unannotated. Feature counting runs separately for each sample and combines the resulting columns, including zero columns for empty samples and absent feature types.
+
+Percentages use the original reads reported by Cutadapt as the denominator, or the sampled input when sampling is enabled. They are not percentages of organism-aligned reads. Samples with no reads report `0.00%`; disabled host categories report zero. Category reports are required to regenerate the expanded breakdown from an existing output directory; rerun the updated pipeline to produce them.
 
 ## Notes
 
@@ -238,6 +270,8 @@ bash map_bacteria_with_decoys.sh configs/project_a.env
 - Ensure the configured bacterial reference and annotation use compatible genome versions.
 
 ## Normalized feature-position analysis
+
+Feature-position analysis includes the combined bacterial RNA and DNA alignments. RNA transcript records retain their own coordinate system, identified by the `RNA__` sequence prefix, and genomic DNA records retain genomic coordinates. These are separate feature observations rather than transcript-to-genome projections.
 
 The post-alignment analysis collapses differently sized annotated features onto a common biological coordinate: **0% is the 5' end and 100% is the 3' end**. It follows genomic start-to-end on `+` features and reverses genomic coordinates on `-` features. Each long-read observation uses the midpoint of its aligned portion. Unmapped, secondary, and supplementary alignments are ignored; duplicates are not filtered.
 

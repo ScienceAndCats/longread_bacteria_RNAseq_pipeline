@@ -88,7 +88,10 @@ def build_rows(output_dir):
             raise ValueError(f"Stage totals are inconsistent for sample {sample}")
         if sample not in assigned:
             raise ValueError(f"Missing featureCounts result for sample {sample}")
-        percent, mean = coverage_counts(alignment_dir / f"{prefix}_coverage.txt", aligned)
+        # RNA transcript coordinates do not contribute to genomic coverage.
+        dna_report = alignment_dir / "dna" / f"{prefix}.bbsplit.txt"
+        coverage_aligned = bbsplit_counts(dna_report)[1] if dna_report.exists() else aligned
+        percent, mean = coverage_counts(alignment_dir / f"{prefix}_coverage.txt", coverage_aligned)
         rows.append((sample, total, passing, aligned, percent, mean, *assigned[sample], eligible, oversized))
     return rows
 

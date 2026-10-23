@@ -1,0 +1,70 @@
+Fetch Shard Index for conda-forge/linux-64                                                      ⧖ Starting
+Fetch Shard Index for conda-forge/linux-64                                                ✔ Done (0.1 sec)
+Fetch Shard Index for conda-forge/noarch                                                        ⧖ Starting
+Fetch Shard Index for conda-forge/noarch                                                  ✔ Done (0.1 sec)
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                    ✔ Done (60.5 sec)
+Fetch Shard Index for bioconda/linux-64                                                         ⧖ Starting
+Fetch Shard Index for bioconda/linux-64                                                   ✔ Done (5.0 sec)
+Fetch Shard Index for bioconda/noarch                                                           ⧖ Starting
+Fetch Shard Index for bioconda/noarch                                                     ✔ Done (0.1 sec)
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                    ✔ Done (10.2 sec)
+Using Cached Shard Index for conda-forge/linux-64                                                   ✔ Done
+Using Cached Shard Index for conda-forge/noarch                                                     ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                    ✔ Done (20.4 sec)
+Using Cached Shard Index for bioconda/linux-64                                                      ✔ Done
+Using Cached Shard Index for bioconda/noarch                                                        ✔ Done
+Fetching and Parsing Packages' Shards                                                           ⧖ Starting
+Fetching and Parsing Packages' Shards                                                     ✔ Done (0.0 sec)
+
+Pinned packages:
+
+  - python=3.13
+
+Resolving Environment                                                                           ⧖ Starting
+Resolving Environment                                                                     ✔ Done (0.3 sec)
+error    libmamba Could not create directory '/home/agent/.mamba/pkgs': Read-only file system
+
+Transaction
+
+  Prefix: /workspace/.cloud-setup/env
+
+  Updating specs:
+
+   - bbmap=39.79
+   - biopython
+
+
+  Package       Version  Build            Channel          Size
+─────────────────────────────────────────────────────────────────
+  Install:
+─────────────────────────────────────────────────────────────────
+
+  + bbmap         39.79  h9b5c0a0_0       bioconda         93MB
+  + biopython      1.88  py313h995f894_1  conda-forge       3MB
+  + giflib        6.1.3  hebe6cf0_2       conda-forge      86kB
+  + openjdk      25.0.2  h1602c4f_26      conda-forge     123MB
+  + xorg-libxt    1.3.1  h7cc23a3_1       conda-forge     384kB
+
+  Summary:
+
+  Install: 5 packages
+
+  Total download: 219MB
+
+─────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking biopython-1.88-py313h995f894_1
+Linking giflib-6.1.3-hebe6cf0_2
+Linking xorg-libxt-1.3.1-h7cc23a3_1
+Linking openjdk-25.0.2-h1602c4f_26
+Linking bbmap-39.79-h9b5c0a0_0
+
+Transaction finished
+

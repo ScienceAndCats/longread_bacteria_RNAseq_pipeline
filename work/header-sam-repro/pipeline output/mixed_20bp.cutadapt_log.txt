@@ -1,0 +1,14 @@
+This is cutadapt 5.2 with Python 3.13.15
+Command line parameters: -j 1 -e 0.15 -O 12 -m 20 --json /workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/mixed_20bp.cutadapt.json -o /workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/.mixed_20bp.adapter_trimmed.fastq /workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/.adapter_trim.oQDko8/trim.fastq
+Processing single-end reads on 1 core ...
+
+=== Summary ===
+
+Total reads processed:                       8
+
+== Read fate breakdown ==
+Reads that were too short:                   1 (12.5%)
+Reads written (passing filters):             7 (87.5%)
+
+Total basepairs processed:        18,419 bp
+Total written (filtered):         18,400 bp (99.9%)

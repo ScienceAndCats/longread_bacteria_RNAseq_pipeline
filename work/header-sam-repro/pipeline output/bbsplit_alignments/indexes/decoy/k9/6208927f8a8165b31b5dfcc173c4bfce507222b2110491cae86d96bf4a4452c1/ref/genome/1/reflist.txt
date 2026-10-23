@@ -1,0 +1,1 @@
+/workspace/longread_bacteria_RNAseq_pipeline/work/header-sam-repro/pipeline output/bbsplit_alignments/references/decoy.fasta
