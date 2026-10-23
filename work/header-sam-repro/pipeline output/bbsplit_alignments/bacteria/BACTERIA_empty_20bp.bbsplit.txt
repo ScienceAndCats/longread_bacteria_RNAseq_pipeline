@@ -1,4 +1,0 @@
-metric	count
-input	0
-aligned	0
-unmapped	0

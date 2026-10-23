@@ -1,4 +1,0 @@
-metric	count
-input	6
-aligned	1
-unmapped	5

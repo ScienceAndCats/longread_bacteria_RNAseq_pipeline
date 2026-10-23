@@ -1,8 +1,0 @@
-test_configured_k_without_host (test_bbsplit_pipeline.BBSplitPipelineTests.test_configured_k_without_host) ... ok
-test_default_k_with_host (test_bbsplit_pipeline.BBSplitPipelineTests.test_default_k_with_host) ... ok
-test_rna_shards_before_dna_and_all_read_categories (test_bbsplit_pipeline.FolderReferencePipelineTests.test_rna_shards_before_dna_and_all_read_categories) ... ok
-
-----------------------------------------------------------------------
-Ran 3 tests in 33.711s
-
-OK
