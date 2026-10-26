@@ -5,6 +5,7 @@ import csv
 import re
 from pathlib import Path
 
+from count_features import CSV_FIELD_SIZE_LIMIT
 from read_breakdown_csv import bbsplit_counts, cutadapt_counts, length_filter_counts, sample_from_log
 
 
@@ -25,6 +26,7 @@ HEADER = (
 
 def feature_counts(path):
     """Return assigned-read and nonzero-feature totals keyed by sample."""
+    csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
     with path.open(newline="") as handle:
         rows = list(csv.reader((line for line in handle if not line.startswith("#")), delimiter="\t"))
     if not rows or len(rows[0]) < 7 or rows[0][0] != "Geneid":
