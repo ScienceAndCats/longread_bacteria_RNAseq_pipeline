@@ -7,7 +7,7 @@ This repository contains a long-read FASTQ processing pipeline for Oxford Nanopo
 `map_bacteria_with_decoys.sh` runs the analysis in these stages:
 
 1. Finds input FASTQ files matching the configured glob and, when sampling is enabled, randomly selects up to the configured number of reads from each file.
-2. Uses Cutadapt to remove user-configured adapter sequences from both read ends, repeating the process for up to `ADAPTER_MAX_TRIMMING_ROUNDS` rounds (default: `3`). Each round removes at most one adapter from the 5′ end and one from the 3′ end, allowing repeated terminal copies to be exposed and removed in later rounds. The minimum read length is applied after all rounds. Reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
+2. Runs one Cutadapt linked-adapter extraction using the configured NEB 5′ and 3′ flanks, then removes remaining terminal adapters for `ADAPTER_MAX_TRIMMING_ROUNDS` rounds (default: `3`). The extraction requires both flanks; reads without a linked match continue to terminal trimming. Each terminal round removes at most one adapter from each read end. The minimum read length is applied after both stages. Reads from `MIN_READ_LENGTH` through **6000 bp inclusive** are kept for alignment; longer reads are saved in a separate FASTQ without further processing and their counts are included in both summary CSVs.
 3. Uses `bbsplit.sh` to map eligible trimmed reads to a decoy/pangenome reference and keeps reads that do **not** map to the decoys.
 4. Maps decoy-unmapped reads in this order: **bacterial RNA → host RNA (if enabled) → bacterial DNA → host DNA (if enabled)**. Only primary-unmapped reads advance to the next stage, so an RNA match takes priority over a later genomic DNA match. RNA stages without reference files are skipped. A final leftover FASTQ contains reads that failed every configured alignment stage. Every stage uses configurable `k` (default `11`) and fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000`, with `qtrim=f` to preserve adapter-trimmed sequences and `interleaved=f` for single-read FASTQ input.
 5. Combines the RNA and DNA alignments for each organism, assigns each mapped read to one exclusive category for the breakdown CSV, and uses `featureCounts` from Subread to count CDS features against the discovered, normalized bacterial and host annotations.
@@ -67,9 +67,11 @@ Edit `config.env` before running the pipeline. The key settings are:
 | `BACTERIA_REFERENCE_DIR` | Folder containing bacterial genomic DNA, CDS/RNA FASTA files, and their annotations, such as `PAO1`. |
 | `HOST_REFERENCE_DIR` | Optional host folder containing DNA and RNA references, including nested folders and RNA shards; leave empty to disable host mapping and counting. |
 | `BBSPLIT_K` | BBSplit k-mer length: integer `1`–`15` (default: `11`). All stages use fixed `mapmode=pb msa=MultiStateAligner9PacBio fastareadlen=6000 qtrim=f interleaved=f`. |
-| `ADAPTER_SEQUENCES` | Adapter DNA sequences separated by whitespace, on one or multiple lines. Default: `TTTCTGTTGGTGCTGATATTGC`. Set to `""` to skip adapter matching. |
-| `ADAPTER_REVERSE_COMPLEMENTS` | Also match the reverse complement of each configured adapter (default: `true`); read orientation remains unchanged. |
-| `ADAPTER_MAX_TRIMMING_ROUNDS` | Maximum rounds of trimming at both ends (default: `3`); each round removes at most one adapter per end. |
+| `ADAPTER_NEB_5P` | Linked extraction's 5′ flank (default: `GTTCAGAGTTCTACAGTCCGACGATC`). |
+| `ADAPTER_NEB_3P` | Linked extraction's 3′ flank (default: `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC`). |
+| `ADAPTER_SEQUENCES` | Whitespace-separated terminal adapters; defaults to the six sequences below. Set to `""` to skip terminal trimming while retaining linked extraction. |
+| `ADAPTER_REVERSE_COMPLEMENTS` | Also match reverse complements during terminal trimming (default: `true`); this stage does not reorient reads. |
+| `ADAPTER_MAX_TRIMMING_ROUNDS` | Terminal-trimming rounds (default: `3`); at most one adapter per end per round. Linked extraction always runs once. |
 | `CUTADAPT_ERROR_RATE` | Maximum adapter alignment error rate (default: `0.15`); mismatches and indels are allowed. |
 | `CUTADAPT_MIN_OVERLAP` | Minimum adapter overlap, in nucleotides (default: `12`). |
 | `MIN_READ_LENGTH` | Minimum retained length **after all trimming**, from `1` through `6000` (default: `20`). Existing project configs with explicit values such as `22` keep that value. The alignment maximum is fixed at `6000` bp. |
@@ -109,10 +111,17 @@ The 6000-bp partition is applied after all adapter trimming and the minimum-leng
 
 ### Adapter trimming
 
-List the adapter sequences present in your Nanopore library. Each sequence is searched at both exposed read ends; an internal adapter-like motif is retained. For example:
+Trimming has two stages: **one linked-adapter extraction**, followed by **three terminal-trimming rounds** by default. The supplied defaults are:
 
 ```bash
-ADAPTER_SEQUENCES="TTTCTGTTGGTGCTGATATTGC"
+ADAPTER_NEB_5P="GTTCAGAGTTCTACAGTCCGACGATC"
+ADAPTER_NEB_3P="AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+ADAPTER_SEQUENCES="TTTCTGTTGGTGCTGATATTGC
+GTTCAGAGTTCTACAGTCCGACGATC
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC
+AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+AATGATACGGCGACCACCGAGATCTACAC
+CAAGCAGAAGACGGCATACGAGAT"
 ADAPTER_REVERSE_COMPLEMENTS="true"
 ADAPTER_MAX_TRIMMING_ROUNDS="3"
 CUTADAPT_ERROR_RATE="0.15"
@@ -120,24 +129,20 @@ CUTADAPT_MIN_OVERLAP="12"
 MIN_READ_LENGTH="20"
 ```
 
-For multiple adapters, put the DNA sequences in the same whitespace-separated string; line breaks are allowed:
+The first pass uses one linked Cutadapt adapter with both NEB flanks required (`--times 1`). It extracts the intervening insert and removes the flanks and any library sequence outside them. The 3′ component uses the rightmost match, preserving intervening adapter copies for subsequent terminal cleanup. Both read orientations are checked with `--revcomp`; a reverse-oriented linked insert is normalized to the NEB forward orientation, and its qualities are reversed with its sequence. Read headers are preserved. Reads without a linked match retain their original sequence and orientation for the next stage; they are not discarded.
 
-```bash
-ADAPTER_SEQUENCES="TTTCTGTTGGTGCTGATATTGC
-ACGTTGCAACGTTGCA"
-```
+Terminal trimming then searches all `ADAPTER_SEQUENCES` at the exposed read ends. List the sequences on one line or multiple lines within the same quoted string. With `ADAPTER_REVERSE_COMPLEMENTS="true"`, reverse-complement adapter sequences are also searched, without further reorienting reads. Internal motifs are retained by terminal trimming; only the preceding linked extraction searches for an NEB-bounded insert within outer sequence.
 
-The second sequence above is illustrative; replace it with an adapter used in your library. With `ADAPTER_REVERSE_COMPLEMENTS="true"`, the pipeline adds each sequence's reverse complement to the matching list automatically. It does not reverse-complement or reorient reads. Headers and base qualities remain associated with the original read, with trimmed bases and their qualities removed together.
-
-In each round, Cutadapt first trims at most one 5′ adapter, then at most one 3′ adapter. A second or third round can remove another adapter copy exposed by the preceding round. `ADAPTER_MAX_TRIMMING_ROUNDS="3"` therefore permits up to three adapter removals per end. Increase the limit if the library contains more repeated terminal copies. The minimum-length filter runs only after all rounds, followed by the fixed 6000-bp alignment limit. Reads with no adapter match are retained if they pass the length filters. Setting `ADAPTER_SEQUENCES=""` skips matching and still applies those filters.
+Each terminal round removes at most one 5′ adapter, then at most one 3′ adapter. Later rounds can remove another copy exposed by the preceding round. `ADAPTER_MAX_TRIMMING_ROUNDS="3"` therefore permits up to three terminal removals per end, in addition to the single linked extraction. Changing this limit never repeats linked extraction. The minimum-length filter runs only after both stages, followed by the fixed 6000-bp alignment limit. Reads without adapter matches remain eligible if they pass the length filters. Setting `ADAPTER_SEQUENCES=""` skips the terminal stage; linked extraction and length filtering still run.
 
 Each sample uses the `<sample>_<length>bp` output prefix:
 
 | File | Contents |
 | --- | --- |
+| `*.linked_adapter.log` and `*.linked_adapter.json` | Native Cutadapt reports for the single linked extraction, including linked matches and reverse-complemented read counts. |
 | `*.adapter_roundN.5p.log` | Native Cutadapt report for the 5′ pass of round `N`. |
 | `*.adapter_roundN.3p.log` | Native Cutadapt report for the 3′ pass of round `N`. |
-| `*.cutadapt_log.txt` and `*.cutadapt.json` | Native Cutadapt reports for the final minimum-length filter. Adapter matches are recorded in the round logs, not accumulated in these final filter reports. |
+| `*.cutadapt_log.txt` and `*.cutadapt.json` | Native Cutadapt reports for the final minimum-length filter. They retain the original input read count because earlier stages do not discard reads. Adapter matches are recorded in the linked/round reports, not accumulated in these final filter reports. |
 
 To trim a FASTQ without any reference mapping, run from the repository:
 
@@ -151,7 +156,7 @@ When the optional local `tests/` fixtures are present, run them in the pipeline 
 python3 -m unittest discover -s tests -v
 ```
 
-The local checks cover trimming at both ends, multiple configured adapters, reverse-complement adapter matching without reorienting reads, repeated terminal copies, internal motifs, empty adapter lists, and final length filtering. Length-partition and CSV checks cover the 6000/6001-bp boundary, gzip output, eligible/oversized counts, and read-count conservation. When dependencies are installed, integration checks run BBSplit through feature counting, coverage, and positional profiling with host mapping enabled and disabled, empty samples, reference folders and RNA shards, GenBank annotations, RNA-before-DNA routing, and exclusive region counts and percentages.
+The local checks cover single linked extraction in both orientations, required flanks, outer library sequences, nested adapter pairs, the six default terminal adapters, repeated terminal copies, internal motifs, empty terminal lists, header/quality preservation, and final length filtering. Length-partition and CSV checks cover the 6000/6001-bp boundary, gzip output, eligible/oversized counts, and read-count conservation. When dependencies are installed, integration checks run BBSplit through feature counting, coverage, and positional profiling with host mapping enabled and disabled, empty samples, reference folders and RNA shards, GenBank annotations, RNA-before-DNA routing, and exclusive region counts and percentages.
 
 To enable host mapping and feature counting, set `HOST_REFERENCE_DIR` to the `human` or `mouse` folder. Setting it to `""` skips host reference preparation, alignment, and counting. Host RNA is searched after bacterial RNA but before bacterial DNA; host DNA is searched last.
 

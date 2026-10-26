@@ -51,6 +51,7 @@ bbsplit_alignments/
 slurm-*.out
 bacteria_pipeline-*.out
 *.cutadapt.json
+*.linked_adapter.json
 *.cutadapt_log.txt
 *.length_filter.tsv
 *.nanopore_adapter_log.txt
