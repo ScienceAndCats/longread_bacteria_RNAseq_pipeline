@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Trim terminal adapters from each Nanopore FASTQ independently.
+# Extract a linked insert once, then trim remaining terminal adapter layers.
 set -euo pipefail
 [[ $# == 4 ]] || { echo "Usage: bash $0 config.env input.fastq[.gz] output.fastq[.gz] report_prefix" >&2; exit 1; }
 # shellcheck source=/dev/null
@@ -9,7 +9,9 @@ if [[ "$input_fastq" -ef "$trimmed_fastq" ]]; then
   echo "Input and output FASTQ must be different files" >&2
   exit 1
 fi
-: "${ADAPTER_SEQUENCES=TTTCTGTTGGTGCTGATATTGC}"
+: "${ADAPTER_NEB_5P=GTTCAGAGTTCTACAGTCCGACGATC}"
+: "${ADAPTER_NEB_3P=AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC}"
+: "${ADAPTER_SEQUENCES=TTTCTGTTGGTGCTGATATTGC GTTCAGAGTTCTACAGTCCGACGATC AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT AATGATACGGCGACCACCGAGATCTACAC CAAGCAGAAGACGGCATACGAGAT}"
 : "${ADAPTER_REVERSE_COMPLEMENTS=true}"
 : "${CUTADAPT_ERROR_RATE=0.15}"
 : "${CUTADAPT_MIN_OVERLAP=12}"
@@ -30,13 +32,13 @@ case "${ADAPTER_REVERSE_COMPLEMENTS,,}" in
   *) echo "ADAPTER_REVERSE_COMPLEMENTS must be true or false" >&2; exit 1 ;;
 esac
 
-# Normalize whitespace-separated adapters, including multiline config strings.
-# Adding reverse-complement sequences never reverses a read or its qualities.
-validated=$(python3 - "$CUTADAPT_ERROR_RATE" "$ADAPTER_SEQUENCES" "$ADAPTER_REVERSE_COMPLEMENTS" <<'PY'
+# Validate both linked flanks and the independent terminal adapter list.
+validated=$(python3 - "$CUTADAPT_ERROR_RATE" "$ADAPTER_NEB_5P" "$ADAPTER_NEB_3P" \
+  "$ADAPTER_SEQUENCES" "$ADAPTER_REVERSE_COMPLEMENTS" <<'PY'
 import math
 import sys
 
-rate, text, reverse = sys.argv[1:]
+rate, five, three, text, reverse = sys.argv[1:]
 try:
     rate = float(rate)
 except ValueError:
@@ -44,10 +46,16 @@ except ValueError:
 if not math.isfinite(rate) or not 0 <= rate < 1:
     raise SystemExit("CUTADAPT_ERROR_RATE must be a finite number with 0 <= value < 1")
 print(rate)
+alphabet = set("ACGTRYSWKMBDHVN")
+for name, sequence in (("ADAPTER_NEB_5P", five), ("ADAPTER_NEB_3P", three)):
+    sequence = sequence.strip().upper()
+    if not sequence or set(sequence) - alphabet:
+        raise SystemExit(f"{name} must be a nonempty DNA IUPAC sequence")
+    print(sequence)
 complement = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
 adapters = []
 for sequence in text.upper().split():
-    if set(sequence) - set("ACGTRYSWKMBDHVN"):
+    if set(sequence) - alphabet:
         raise SystemExit("ADAPTER_SEQUENCES must contain whitespace-separated DNA IUPAC sequences")
     for adapter in (sequence, sequence.translate(complement)[::-1]) if reverse.lower() == "true" else (sequence,):
         if adapter not in adapters:
@@ -58,7 +66,9 @@ PY
 )
 mapfile -t validated_lines <<< "$validated"
 error_rate=${validated_lines[0]}
-adapters=("${validated_lines[@]:1}")
+linked_five=${validated_lines[1]}
+linked_three=${validated_lines[2]}
+adapters=("${validated_lines[@]:3}")
 five_args=(); three_args=()
 for adapter in "${adapters[@]}"; do
   # X is Cutadapt's non-internal adapter sentinel: full and partial terminal
@@ -77,13 +87,24 @@ temp_dir=$(mktemp -d "$(dirname "$trimmed_fastq")/.adapter_trim.XXXXXX")
 trap 'rm -rf -- "$temp_dir"' EXIT
 current_input=$input_fastq
 common=(-j "$THREADS" -e "$error_rate" -O "$CUTADAPT_MIN_OVERLAP" --times 1)
+# This is a single extraction pass, independent of the terminal round limit.
+# Require both unanchored flanks so outer library sequence can be removed.
+# The rightmost 3' match retains intervening adapter copies for terminal cleanup.
+# Normalize reverse-oriented linked inserts, preserving their original headers.
+cutadapt "${common[@]}" --revcomp --rename '{header}' \
+  -g "neb_linked=${linked_five};required...${linked_three};required;rightmost" \
+  --json "${report_prefix}.linked_adapter.json" -o "$temp_dir/linked.fastq" "$current_input" \
+  > "${report_prefix}.linked_adapter.log"
+current_input="$temp_dir/linked.fastq"
 if (( ${#adapters[@]} )); then
   for (( round=1; round<=ADAPTER_MAX_TRIMMING_ROUNDS; round++ )); do
     # Run passes sequentially so THREADS bounds concurrent Cutadapt workers.
     # Keep only the current and next temporary FASTQ while each pass runs.
     cutadapt "${common[@]}" "${five_args[@]}" -o "$temp_dir/five.fastq" "$current_input" \
       > "${report_prefix}.adapter_round${round}.5p.log"
-    if [[ "$current_input" == "$temp_dir/three.fastq" ]]; then rm -- "$current_input"; fi
+    if [[ "$current_input" == "$temp_dir/three.fastq" || "$current_input" == "$temp_dir/linked.fastq" ]]; then
+      rm -- "$current_input"
+    fi
     cutadapt "${common[@]}" "${three_args[@]}" -o "$temp_dir/three.fastq" "$temp_dir/five.fastq" \
       > "${report_prefix}.adapter_round${round}.3p.log"
     rm -- "$temp_dir/five.fastq"
@@ -91,8 +112,8 @@ if (( ${#adapters[@]} )); then
   done
 fi
 
-# No earlier pass filters reads: this final native Cutadapt report retains the
-# original input count and applies the minimum only after all adapter rounds.
+# Neither extraction nor terminal trimming filters reads: the final native
+# Cutadapt report retains the original count and applies the minimum last.
 final_output="$temp_dir/final.fastq"
 if [[ "$trimmed_fastq" == *.gz ]]; then final_output+=".gz"; fi
 cutadapt -j "$THREADS" -m "$MIN_READ_LENGTH" --json "${report_prefix}.cutadapt.json" \
