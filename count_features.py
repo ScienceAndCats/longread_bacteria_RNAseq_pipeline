@@ -17,6 +17,8 @@ from pathlib import Path
 
 
 FEATURE_HEADER = ["Geneid", "Chr", "Start", "End", "Strand", "Length"]
+# Large genes can produce long semicolon-separated annotation coordinate fields.
+CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
 SUMMARY_STATUSES = (
     "Assigned", "Unassigned_Unmapped", "Unassigned_Read_Type", "Unassigned_Singleton",
     "Unassigned_MappingQuality", "Unassigned_Chimera", "Unassigned_FragmentLength",
@@ -42,6 +44,7 @@ def has_feature_type(annotation, feature_type):
 
 
 def read_single_table(path, *, summary=False):
+    csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
     with path.open(newline="") as handle:
         rows = list(csv.reader((line for line in handle if not line.startswith("#")), delimiter="\t"))
     width = 1 if summary else 6

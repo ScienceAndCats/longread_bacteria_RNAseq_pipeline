@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from bacteria_with_decoys_csvConversion import HEADER, build_rows
-from count_features import FEATURE_HEADER, merge_column, read_single_table
+from count_features import CSV_FIELD_SIZE_LIMIT, FEATURE_HEADER, merge_column, read_single_table
 from read_breakdown_csv import ATTRIBUTES, build_table, percentage
 
 
@@ -18,6 +18,7 @@ def host_enabled(config):
 
 
 def combine_feature_tables(sources, destination):
+    csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
     table, summary = None, None
     alignments = []
     for source in sources:
